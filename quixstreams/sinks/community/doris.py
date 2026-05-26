@@ -38,6 +38,10 @@ __all__ = ("DorisSink", "DorisSinkException")
 
 logger = logging.getLogger(__name__)
 
+StreamLoadErrorCallback = Callable[
+    [str, list[dict], Exception], None
+]  # (table, rows, exception) → None
+
 MergeType = Literal["APPEND", "DELETE", "MERGE"]
 PartialUpdateMode = Literal["none", "fixed", "flexible"]
 MetadataField = Literal["key", "topic", "partition", "offset", "headers", "timestamp"]
@@ -81,6 +85,7 @@ class DorisSink(BatchingSink):
         sequence_column: str | None = None,
         send_batch_parallelism: int | None = None,
         hidden_columns: list[str] | None = None,
+        on_stream_load_error: StreamLoadErrorCallback | None = None,
         on_client_connect_success: ClientConnectSuccessCallback | None = None,
         on_client_connect_failure: ClientConnectFailureCallback | None = None,
     ):
@@ -129,6 +134,11 @@ class DorisSink(BatchingSink):
             Capped by BE config max_send_batch_parallelism_per_job.
         :param hidden_columns: List of Doris hidden columns present in data.
             E.g. ["__DORIS_DELETE_SIGN__", "__DORIS_SEQUENCE_COL__"].
+        :param on_stream_load_error: Callback invoked when Stream Load fails.
+            Receives (table_name, failed_rows, exception). If provided, the
+            error is logged but not re-raised — the pipeline continues.
+            Use this to route failed batches to a DLQ topic, error table, etc.
+            If None (default), DorisSinkException is raised and the app crashes.
         :param on_client_connect_success: An optional callback made after successful
             client authentication, primarily for additional logging.
         :param on_client_connect_failure: An optional callback made after failed
@@ -176,6 +186,7 @@ class DorisSink(BatchingSink):
         self._sequence_column = sequence_column
         self._send_batch_parallelism = send_batch_parallelism
         self._hidden_columns = hidden_columns
+        self._on_stream_load_error = on_stream_load_error
         if include_metadata is True:
             self._metadata_fields = ALL_METADATA_FIELDS
         elif include_metadata is False:
@@ -221,7 +232,17 @@ class DorisSink(BatchingSink):
             rows.append(row)
 
         for table, rows in tables.items():
-            self._stream_load(table, rows)
+            try:
+                self._stream_load(table, rows)
+            except DorisSinkException as e:
+                if self._on_stream_load_error is not None:
+                    logger.error(
+                        f"Stream Load failed for table '{table}' "
+                        f"({len(rows)} rows), routing to error handler: {e}"
+                    )
+                    self._on_stream_load_error(table, rows, e)
+                else:
+                    raise
 
     def add(
         self,

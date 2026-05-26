@@ -138,11 +138,90 @@ Doris 表有兩個隱藏的系統欄位，可以直接在資料中控制：
 預設由 BE 的 `max_send_batch_parallelism_per_job` 限制。
 資料量大、BE 節點多時可以適當調高（如 `4` 或 `8`）來提升吞吐。
 
-### 錯誤處理
+### 錯誤處理與 Dead Letter Queue
 
-- Stream Load 是 atomic 的 — 整個 batch 成功或失敗
-- 失敗時拋出 `DorisSinkException`，讓 Quix Streams checkpoint 機制 retry
+#### 錯誤傳播路徑
+
+```
+DorisSink._stream_load()
+    │
+    ├── 成功 → log info，繼續
+    ├── Publish Timeout → log warning，繼續（資料已 commit）
+    └── 失敗 → DorisSinkException
+              │
+              ├── on_stream_load_error 有設定？
+              │     ├── 有 → 呼叫 callback(table, rows, exception)，不 raise，pipeline 繼續
+              │     └── 沒有 → raise → BatchingSink.flush() → Checkpoint.commit() → app crash
+              │
+              └── app 重啟後從 last committed offset 重新消費
+```
+
+#### 預設行為（不設 callback）
+
+Stream Load 失敗 → `DorisSinkException` → 整個 app crash → 重啟後 replay。
+這是最安全的，保證 at-least-once，但任何一張 table 失敗會卡住所有 table。
+
+#### `on_stream_load_error` callback（Dead Letter / Error Routing）
+
+設定 `on_stream_load_error` 後，Stream Load 失敗**不會 crash app**。
+Callback 接收 `(table_name, failed_rows, exception)`，你可以：
+- 寫到 DLQ Kafka topic
+- 寫到 Doris error table
+- 寫到本地檔案
+- 送 alert
+
+**重要**：使用 callback 代表你接受這些 row 不會寫到原本的目標 table。
+如果 callback 本身也失敗（拋出異常），該異常會直接 propagate，app 仍然會 crash。
+
+#### Side Output（SDF 層級）
+
+Quix Streams 的 `StreamingDataFrame` 支援 filter + branch，可以在 SDF 層級做 side output：
+
+```python
+sdf = app.dataframe(topic)
+
+# 正常資料 → Doris
+sdf.filter(lambda v: v.get("is_valid", True)).sink(doris_sink)
+
+# 異常資料 → DLQ topic
+dlq_topic = app.topic("dlq.my_topic")
+sdf.filter(lambda v: not v.get("is_valid", True)).to_topic(dlq_topic)
+```
+
+#### `on_processing_error`（SDF pipeline 層級）
+
+`Application(on_processing_error=callback)` 可以攔截 SDF pipeline 內的錯誤（如 apply/filter/update 拋的異常）。
+callback 回傳 `True` 跳過該筆 message，回傳 `False` 讓 app crash。
+
+**限制**：`on_processing_error` **不 cover sink flush 錯誤**。
+Sink 的 `write()` 發生在 `Checkpoint.commit()` 階段，不在 SDF pipeline 內。
+所以 DorisSink 的 Stream Load 失敗只能靠 `on_stream_load_error` 處理。
+
+#### 三層錯誤處理總覽
+
+| 層級 | 機制 | 攔截什麼 | 適用 sink | 範例 |
+|------|------|---------|----------|------|
+| **SDF pipeline** | `sdf.filter()` + side output | 資料本身有問題（格式、欄位缺失） | 所有 sink | 無效資料 → DLQ topic |
+| **SDF pipeline** | `on_processing_error` | apply/filter/update 拋的異常 | 所有 sink | JSON parse 失敗 → 跳過 |
+| **Sink flush** | `on_stream_load_error` | Stream Load HTTP 失敗 | **僅 DorisSink** | Doris 掛了 → 寫 DLQ |
+
+**Sink DLQ 支援範圍：**
+
+| Sink | sink error DLQ | 失敗行為 |
+|------|---------------|---------|
+| **DorisSink** | 支援（`on_stream_load_error`） | 根據 callback 處理（寫 DLQ / skip / crash） |
+| **KafkaSink** | 不支援 | 直接 crash，重啟後 replay |
+| **PostgreSQLSink** | 不支援 | 直接 crash，重啟後 replay |
+
+前兩層（side output + `on_processing_error`）是 Quix Streams 框架層級的，和 sink 類型無關，
+發生在資料到達 sink 之前，對所有 sink 都有效。
+
+第三層（`on_stream_load_error`）是 DorisSink 自己實作的，其他 sink 沒有對應的 error callback。
+如果 fan-out 同時用 DorisSink + KafkaSink，DorisSink 失敗可以走 DLQ 繼續，
+KafkaSink 失敗仍然 crash，兩者互不影響。
+
 - `max_filter_ratio` 預設為 `0`（zero tolerance），可由使用者調整
+- Stream Load 是 atomic 的 — 整個 batch 成功或失敗，沒有 partial success
 
 ## Usage
 
@@ -366,6 +445,145 @@ doris_sink = DorisSink(
 # Kafka message: {"order_id": 1002, "__DORIS_DELETE_SIGN__": 1}                  → 刪除
 ```
 
+### Error Handling — DLQ / Error Table
+
+```python
+# ── 方式 1：失敗的 batch 寫到 Kafka DLQ topic ──
+from quixstreams import Application
+
+app = Application(broker_address="kafka:9092", consumer_group="my-group")
+dlq_topic = app.topic("dlq.doris_errors")
+
+def send_to_dlq(table, rows, exception):
+    """Stream Load 失敗時，把 failed rows 逐筆寫到 DLQ topic。"""
+    with app.get_producer() as producer:
+        for row in rows:
+            producer.produce(
+                topic=dlq_topic.name,
+                value=orjson.dumps({
+                    "failed_table": table,
+                    "error": str(exception),
+                    "row": row,
+                }),
+            )
+
+doris_sink = DorisSink(
+    ...,
+    on_stream_load_error=send_to_dlq,   # 失敗不 crash，寫 DLQ
+)
+```
+
+```python
+# ── 方式 2：失敗的 batch 寫到 Doris error table ──
+#
+# 適合所有資料都在 Doris 內查詢的場景，不需要額外的 Kafka DLQ topic。
+#
+# Step 1: 在 Doris 建立 error table（Duplicate Key，保留所有 error 記錄）
+#
+#   CREATE TABLE `error_log`.`__dlq` (
+#       `error_time`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+#       `failed_table`  VARCHAR(256)    NOT NULL,
+#       `error_message` TEXT            NOT NULL,
+#       `row_data`      JSON            NOT NULL
+#   )
+#   DUPLICATE KEY(`error_time`, `failed_table`)
+#   DISTRIBUTED BY HASH(`failed_table`) BUCKETS AUTO;
+#
+# Step 2: 建立 error sink + callback
+
+import logging
+_logger = logging.getLogger(__name__)
+
+error_sink = DorisSink(
+    host="doris-fe",
+    http_port=8030,
+    username="root",
+    password="",
+    database="error_log",
+    table_name="__dlq",
+    flatten_value=False,               # row_data 欄位用 JSON 存整個原始 row
+    include_metadata=False,
+    # 不設 on_stream_load_error — error sink 失敗就讓 app crash
+    # 避免無限遞迴（error sink 失敗 → 再寫 error sink → ...）
+)
+error_sink.setup()
+
+def send_to_error_table(table, rows, exception):
+    """失敗的 rows 連同 error 資訊寫到 Doris error table。
+
+    寫入的每筆 row：
+      - error_time:    由 Doris DEFAULT CURRENT_TIMESTAMP 自動填入
+      - failed_table:  原本要寫入的目標 table（如 "ods_orders"）
+      - error_message: DorisSinkException 完整錯誤訊息（含 ErrorURL）
+      - row_data:      原始資料 JSON（包含所有欄位 + metadata）
+    """
+    error_rows = [
+        {
+            "failed_table": table,
+            "error_message": str(exception),
+            "row_data": row,
+        }
+        for row in rows
+    ]
+    try:
+        error_sink._stream_load("__dlq", error_rows)
+        _logger.info(f"Wrote {len(error_rows)} failed rows to error_log.__dlq")
+    except Exception as e:
+        # error sink 也失敗 → 不吞，讓 app crash，避免資料靜默丟失
+        _logger.error(f"Failed to write to error table: {e}")
+        raise
+
+doris_sink = DorisSink(
+    ...,
+    on_stream_load_error=send_to_error_table,
+)
+
+# Step 3: 查詢 error 記錄
+#
+#   -- 最近 100 筆 error
+#   SELECT * FROM error_log.__dlq ORDER BY error_time DESC LIMIT 100;
+#
+#   -- 某張 table 的 error
+#   SELECT error_time, error_message, JSON_EXTRACT(row_data, '$.order_id')
+#   FROM error_log.__dlq
+#   WHERE failed_table = 'ods_orders' AND error_time > '2025-01-15';
+#
+#   -- 統計各 table error 數量
+#   SELECT failed_table, COUNT(*) AS cnt
+#   FROM error_log.__dlq
+#   WHERE error_time > NOW() - INTERVAL 1 HOUR
+#   GROUP BY failed_table ORDER BY cnt DESC;
+```
+
+```python
+# ── 方式 3：搭配 SDF side output 做完整的三層 error handling ──
+app = Application(
+    broker_address="kafka:9092",
+    consumer_group="my-group",
+    # 層級 2：SDF pipeline 內的錯誤（apply/filter 拋異常）→ 跳過該筆
+    on_processing_error=lambda exc, row, log: True,
+)
+
+topic = app.topic("cdc.public.orders")
+dlq_topic = app.topic("dlq.orders")
+sdf = app.dataframe(topic)
+
+# 層級 1：SDF side output — 資料本身有問題的提早分流到 DLQ
+sdf.filter(lambda v: not v.get("is_valid", True)).to_topic(dlq_topic)
+valid = sdf.filter(lambda v: v.get("is_valid", True))
+
+# 層級 3：Sink flush 失敗 — Stream Load error → DLQ
+def on_error(table, rows, exc):
+    with app.get_producer() as p:
+        for row in rows:
+            p.produce(topic=dlq_topic.name, value=orjson.dumps(row))
+
+doris_sink = DorisSink(..., on_stream_load_error=on_error)
+valid.sink(doris_sink)
+
+app.run()
+```
+
 ### 進階設定 — 完整 CDC pipeline
 
 ```python
@@ -389,6 +607,8 @@ doris_sink = DorisSink(
     timeout_seconds=120,
     max_filter_ratio=0.1,
     extra_headers={"timezone": "Asia/Taipei"},
+    # 錯誤處理
+    on_stream_load_error=send_to_dlq,  # 失敗不 crash
 )
 ```
 

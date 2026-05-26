@@ -89,6 +89,7 @@ Image rebuild 時機：升級 quixstreams 版本、新增 sink type。**日常�
 ```python
 import os
 import yaml
+import orjson
 from quixstreams import Application
 
 
@@ -189,16 +190,165 @@ def resolve_sinks(topic_name, topic_overrides, default_sink_configs):
     return [build_sink(c, topic_name=topic_name) for c in configs]
 
 
+def make_kafka_dlq_handler(app, dlq_topic_name):
+    """DLQ 方式 1：失敗的 rows 寫到 Kafka DLQ topic。"""
+    def handler(table, rows, exception):
+        with app.get_producer() as producer:
+            for row in rows:
+                producer.produce(
+                    topic=dlq_topic_name,
+                    value=orjson.dumps({
+                        "failed_table": table,
+                        "error": str(exception),
+                        "row": row,
+                    }),
+                )
+    return handler
+
+
+def make_doris_dlq_handler(
+    host, http_port, username, password, database, error_table="__dlq",
+):
+    """DLQ 方式 2：失敗的 rows 寫到 Doris error table。
+
+    Error table schema（Doris Duplicate Key 表，不做 dedup，保留所有 error 記錄）：
+        CREATE TABLE `{database}`.`{error_table}` (
+            `error_time`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `failed_table`  VARCHAR(256)    NOT NULL,
+            `error_message` TEXT            NOT NULL,
+            `row_data`      JSON            NOT NULL
+        )
+        DUPLICATE KEY(`error_time`, `failed_table`)
+        DISTRIBUTED BY HASH(`failed_table`) BUCKETS AUTO;
+
+    寫入的每筆 row 包含：
+      - error_time:    Stream Load 失敗的時間（由 Doris DEFAULT CURRENT_TIMESTAMP 填入）
+      - failed_table:  原本要寫入的目標 table name
+      - error_message: DorisSinkException 的錯誤訊息（含 Doris ErrorURL）
+      - row_data:      原始資料（JSON 格式，包含所有欄位 + metadata）
+    """
+    from quixstreams.sinks.community.doris import DorisSink
+
+    error_sink = DorisSink(
+        host=host,
+        http_port=http_port,
+        username=username,
+        password=password,
+        database=database,
+        table_name=error_table,
+        flatten_value=False,           # 整個 row 塞進 __value，不展開
+        include_metadata=False,        # error table 有自己的 schema
+        # 不設 on_stream_load_error — error sink 自己失敗就讓 app crash
+        # 避免無限遞迴（error sink 失敗 → 再寫 error sink → ...）
+    )
+    error_sink.setup()
+
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    def handler(table, rows, exception):
+        error_rows = [
+            {
+                "failed_table": table,
+                "error_message": str(exception),
+                "row_data": row,
+            }
+            for row in rows
+        ]
+        try:
+            error_sink._stream_load(error_table, error_rows)
+            _logger.info(
+                f"Wrote {len(error_rows)} failed rows to "
+                f"Doris {database}.{error_table}"
+            )
+        except Exception as e:
+            # error sink 也失敗 → 不吞，讓 app crash，避免資料靜默丟失
+            _logger.error(
+                f"Failed to write to error table "
+                f"{database}.{error_table}: {e}"
+            )
+            raise
+
+    return handler
+
+
+def build_dlq_handler(prefix, app, source_label):
+    """根據環境變數 DLQ_{prefix}_MODE 建立對應的 DLQ handler。
+
+    prefix: "PROCESSING" 或 "SINK"
+    source_label: 寫入 error record 的 source 欄位（"processing_error" 或 "sink_error"）
+    """
+    mode = os.environ.get(f"DLQ_{prefix}_MODE", "crash")
+
+    if mode == "kafka":
+        topic = os.environ.get(
+            f"DLQ_{prefix}_TOPIC",
+            f"dlq.{source_label}-{os.environ['GROUP_NAME']}",
+        )
+        return make_kafka_dlq_handler(app, topic)
+
+    if mode == "doris":
+        return make_doris_dlq_handler(
+            host=os.environ.get(f"DLQ_{prefix}_DORIS_HOST", "doris-fe"),
+            http_port=int(os.environ.get(f"DLQ_{prefix}_DORIS_HTTP_PORT", "8030")),
+            username=os.environ.get(f"DLQ_{prefix}_DORIS_USERNAME", "root"),
+            password=os.environ.get(f"DLQ_{prefix}_DORIS_PASSWORD", ""),
+            database=os.environ.get(f"DLQ_{prefix}_DORIS_DATABASE", "error_log"),
+            error_table=os.environ.get(f"DLQ_{prefix}_DORIS_TABLE", f"__dlq_{source_label}"),
+        )
+
+    if mode == "skip":
+        return lambda table, rows, exc: logger.warning(
+            f"Skipped {len(rows)} failed rows for table '{table}': {exc}"
+        )
+
+    # mode == "crash" 或其他 → 回傳 None，讓錯誤直接 raise
+    return None
+
+
+def make_processing_error_handler(dlq_handler):
+    """建立 on_processing_error callback。
+
+    如果 dlq_handler 有設定，把失敗的 row 寫到 DLQ 並跳過。
+    如果沒有（crash mode），回傳 False 讓 app crash。
+    """
+    if dlq_handler is None:
+        return lambda exc, row, log: False  # crash
+
+    def handler(exc, row, log):
+        try:
+            row_data = {"value": row.value, "key": row.key} if row else {}
+            dlq_handler(
+                table="__processing_error",
+                rows=[row_data],
+                exception=exc,
+            )
+        except Exception as dlq_exc:
+            log.error(f"Failed to write processing error to DLQ: {dlq_exc}")
+            return False  # DLQ 也失敗 → crash
+        return True  # 寫 DLQ 成功 → 跳過該筆
+
+    return handler
+
+
 def main():
     group_config = load_group_config()
     group_name = os.environ["GROUP_NAME"]
 
+    # ── 建立兩層 DLQ handlers ──
+    # 先建 app（不帶 on_processing_error），再建 handler，最後注入
     app = Application(
         broker_address=os.environ["BROKER_ADDRESS"],
         consumer_group=f"passthrough-{group_name}",
         auto_offset_reset="earliest",
         loglevel=os.environ.get("LOG_LEVEL", "INFO"),
     )
+
+    processing_dlq = build_dlq_handler("PROCESSING", app, "processing")
+    sink_dlq = build_dlq_handler("SINK", app, "sink")
+
+    # 注入 on_processing_error
+    app._on_processing_error = make_processing_error_handler(processing_dlq)
 
     # default_sinks 支援單一 dict 或 list（fan-out）
     default_sinks = group_config.get("default_sinks") or group_config["default_sink"]
@@ -211,6 +361,8 @@ def main():
         topic = app.topic(topic_name)
         sdf = app.dataframe(topic)
         for sink in sinks:
+            if hasattr(sink, '_on_stream_load_error') and sink._on_stream_load_error is None:
+                sink._on_stream_load_error = sink_dlq
             sdf.sink(sink)
 
     app.run()
@@ -260,6 +412,106 @@ resources:
   limits:
     memory: 512Mi
     cpu: 500m
+
+# ── DLQ 設定 ──────────────────────────────────────────────────
+# 兩層錯誤各自獨立選擇 DLQ 目的地：
+#   processing_error — SDF pipeline 內的錯誤（apply/filter/update 拋異常）
+#   sink_error       — Sink flush 失敗（Stream Load / DB write 錯誤）
+#
+# 每層的 mode：kafka | doris | skip | crash
+#   kafka — 寫到 Kafka DLQ topic
+#   doris — 寫到 Doris error table
+#   skip  — 跳過該筆/該 batch，不寫 DLQ，pipeline 繼續（靜默丟棄）
+#   crash — 不處理，直接 crash app（重啟後 replay）
+#
+# 兩層可以指向同一個目的地，也可以各走各的。
+dlq:
+  # ── SDF pipeline 錯誤（on_processing_error）──
+  # apply/filter/update 拋異常時，該筆 message 怎麼處理
+  processing_error:
+    mode: kafka                        # kafka | doris | skip | crash
+    kafka:
+      topic: "dlq.processing-errors"   # 固定 topic name，或留空用預設 dlq.processing-{group}
+    # doris:                           # mode=doris 時取消註解
+    #   host: doris-fe
+    #   http_port: 8030
+    #   database: error_log
+    #   table: __dlq_processing
+
+  # ── Sink flush 錯誤（on_stream_load_error）──
+  # DorisSink Stream Load 失敗時，整個 failed batch 怎麼處理
+  sink_error:
+    mode: doris                        # kafka | doris | skip | crash
+    # kafka:
+    #   topic: "dlq.sink-errors"
+    doris:
+      host: doris-fe
+      http_port: 8030
+      database: error_log
+      table: __dlq_sink
+      username: root
+      passwordSecretRef:
+        name: quix-passthrough-vault
+        key: doris-dlq-password
+
+  # ── 共用 Doris error table 設定（可選）──
+  # 如果兩層都用 doris 且想寫到同一張表，可以用 shared_doris 省掉重複設定
+  # processing_error 和 sink_error 的 doris 設定會 fallback 到這裡
+  # shared_doris:
+  #   host: doris-fe
+  #   http_port: 8030
+  #   database: error_log
+  #   table: __dlq
+  #   username: root
+  #   passwordSecretRef:
+  #     name: quix-passthrough-vault
+  #     key: doris-dlq-password
+
+# ── 組合範例 ──────────────────────────────────────────────────
+#
+# 範例 1：兩層都走 Kafka DLQ（最簡單）
+#   dlq:
+#     processing_error:
+#       mode: kafka
+#     sink_error:
+#       mode: kafka
+#
+# 範例 2：SDF 錯誤跳過，Sink 錯誤寫 Doris（推薦 CDC 場景）
+#   dlq:
+#     processing_error:
+#       mode: skip              # 格式錯的資料直接丟棄
+#     sink_error:
+#       mode: doris             # Doris 暫時掛了 → 寫 error table
+#
+# 範例 3：兩層都寫到同一張 Doris error table
+#   dlq:
+#     processing_error:
+#       mode: doris
+#     sink_error:
+#       mode: doris
+#     shared_doris:
+#       host: doris-fe
+#       database: error_log
+#       table: __dlq
+#
+# 範例 4：Sink 錯誤直接 crash（at-least-once 最安全）
+#   dlq:
+#     processing_error:
+#       mode: skip
+#     sink_error:
+#       mode: crash
+#
+# 使用 mode=doris 前需要先在 Doris 建立 error table：
+#
+#   CREATE TABLE `error_log`.`__dlq_sink` (
+#       `error_time`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+#       `source`        VARCHAR(64)     NOT NULL COMMENT 'processing_error or sink_error',
+#       `failed_table`  VARCHAR(256)    NOT NULL,
+#       `error_message` TEXT            NOT NULL,
+#       `row_data`      JSON            NOT NULL
+#   )
+#   DUPLICATE KEY(`error_time`, `source`, `failed_table`)
+#   DISTRIBUTED BY HASH(`failed_table`) BUCKETS AUTO;
 
 # ── Group 定義 ──────────────────────────────────────
 # 所有設定（K8s 部署 + topic 分組 + sink）都在這裡，一個檔案管所有
@@ -761,6 +1013,66 @@ spec:
                   key: {{ .vaultKey }}
             {{- end }}
             {{- end }}
+            {{- with $.Values.dlq }}
+            {{- /* ── processing_error DLQ ── */}}
+            {{- with .processing_error }}
+            - name: DLQ_PROCESSING_MODE
+              value: {{ .mode | default "crash" | quote }}
+            {{- if eq (.mode | default "crash") "kafka" }}
+            - name: DLQ_PROCESSING_TOPIC
+              value: {{ (.kafka).topic | default (printf "dlq.processing-%s" $name) | quote }}
+            {{- end }}
+            {{- if eq (.mode | default "crash") "doris" }}
+            {{- $d := .doris | default ($.Values.dlq).shared_doris | default dict }}
+            - name: DLQ_PROCESSING_DORIS_HOST
+              value: {{ $d.host | quote }}
+            - name: DLQ_PROCESSING_DORIS_HTTP_PORT
+              value: {{ $d.http_port | default 8030 | quote }}
+            - name: DLQ_PROCESSING_DORIS_DATABASE
+              value: {{ $d.database | default "error_log" | quote }}
+            - name: DLQ_PROCESSING_DORIS_TABLE
+              value: {{ $d.table | default "__dlq_processing" | quote }}
+            - name: DLQ_PROCESSING_DORIS_USERNAME
+              value: {{ $d.username | default "root" | quote }}
+            {{- if $d.passwordSecretRef }}
+            - name: DLQ_PROCESSING_DORIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $d.passwordSecretRef.name }}
+                  key: {{ $d.passwordSecretRef.key }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- /* ── sink_error DLQ ── */}}
+            {{- with .sink_error }}
+            - name: DLQ_SINK_MODE
+              value: {{ .mode | default "crash" | quote }}
+            {{- if eq (.mode | default "crash") "kafka" }}
+            - name: DLQ_SINK_TOPIC
+              value: {{ (.kafka).topic | default (printf "dlq.sink-%s" $name) | quote }}
+            {{- end }}
+            {{- if eq (.mode | default "crash") "doris" }}
+            {{- $d := .doris | default ($.Values.dlq).shared_doris | default dict }}
+            - name: DLQ_SINK_DORIS_HOST
+              value: {{ $d.host | quote }}
+            - name: DLQ_SINK_DORIS_HTTP_PORT
+              value: {{ $d.http_port | default 8030 | quote }}
+            - name: DLQ_SINK_DORIS_DATABASE
+              value: {{ $d.database | default "error_log" | quote }}
+            - name: DLQ_SINK_DORIS_TABLE
+              value: {{ $d.table | default "__dlq_sink" | quote }}
+            - name: DLQ_SINK_DORIS_USERNAME
+              value: {{ $d.username | default "root" | quote }}
+            {{- if $d.passwordSecretRef }}
+            - name: DLQ_SINK_DORIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $d.passwordSecretRef.name }}
+                  key: {{ $d.passwordSecretRef.key }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
           volumeMounts:
             - name: config
               mountPath: /config
@@ -892,6 +1204,81 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 ```
 
+### `templates/_validate.tpl`
+
+Helm template 層的 pre-deploy 檢查。`helm install/upgrade` 時如果設定不合法，
+直接 `fail` 擋住，不會產生任何 K8s 資源。
+
+```yaml
+{{- /* ── DLQ 設定驗證 ── */}}
+
+{{- $validModes := list "kafka" "doris" "skip" "crash" }}
+
+{{- with .Values.dlq }}
+
+{{- /* processing_error 驗證 */}}
+{{- with .processing_error }}
+{{- if not (has .mode $validModes) }}
+{{- fail (printf "dlq.processing_error.mode must be one of %s, got '%s'" ($validModes | join ", ") .mode) }}
+{{- end }}
+{{- if and (eq .mode "doris") (not (or .doris ($.Values.dlq).shared_doris)) }}
+{{- fail "dlq.processing_error.mode=doris requires either processing_error.doris or shared_doris config" }}
+{{- end }}
+{{- end }}
+
+{{- /* sink_error 驗證 */}}
+{{- with .sink_error }}
+{{- if not (has .mode $validModes) }}
+{{- fail (printf "dlq.sink_error.mode must be one of %s, got '%s'" ($validModes | join ", ") .mode) }}
+{{- end }}
+{{- if and (eq .mode "doris") (not (or .doris ($.Values.dlq).shared_doris)) }}
+{{- fail "dlq.sink_error.mode=doris requires either sink_error.doris or shared_doris config" }}
+{{- end }}
+{{- end }}
+
+{{- end }}
+
+{{- /* ── Group 設定驗證 ── */}}
+
+{{- range $name, $group := .Values.groups }}
+
+{{- /* 每個 group 必須有 config */}}
+{{- if not $group.config }}
+{{- fail (printf "groups.%s.config is required" $name) }}
+{{- end }}
+
+{{- /* config 必須有 default_sink 或 default_sinks */}}
+{{- if and (not $group.config.default_sink) (not $group.config.default_sinks) }}
+{{- fail (printf "groups.%s.config must have default_sink or default_sinks" $name) }}
+{{- end }}
+
+{{- /* config 必須有 topics */}}
+{{- if not $group.config.topics }}
+{{- fail (printf "groups.%s.config.topics is required" $name) }}
+{{- end }}
+
+{{- /* sink_error DLQ 設定了非 crash mode，但 group 沒有用 doris sink → 警告 */}}
+{{- /* （Helm 沒有 warn function，用 printf 到 Notes.txt 提醒） */}}
+
+{{- end }}
+```
+
+在 `templates/deployment.yaml` 最上方加一行引用驗證：
+
+```yaml
+{{- include "quix-passthrough._validate" . }}
+{{- range $name, $group := .Values.groups }}
+...
+```
+
+這些檢查在 `helm install/upgrade` 時執行，錯誤範例：
+
+```
+$ helm upgrade quix-passthrough ./chart/quix-passthrough
+Error: execution error at (quix-passthrough/templates/deployment.yaml:1):
+  dlq.sink_error.mode=doris requires either sink_error.doris or shared_doris config
+```
+
 ---
 
 ## 日常操作 Runbook
@@ -967,6 +1354,220 @@ helm upgrade quix-passthrough ./chart/quix-passthrough -n quix
 | Pod ready status | K8s | ready pods < desired replicas 持續 3 分鐘 |
 | Sink write errors | App /metrics endpoint | error rate > 0 持續 1 分鐘 |
 | Memory usage | cAdvisor | > 80% of limit 持續 5 分鐘 |
+| DLQ topic lag | kafka_exporter | `dlq.processing-*` 或 `dlq.sink-*` 有新 message |
+| DLQ Doris error count | Doris SQL | `SELECT COUNT(*) FROM error_log.__dlq_sink WHERE error_time > NOW() - INTERVAL 5 MINUTE` |
+
+---
+
+## 錯誤處理架構
+
+```
+Kafka message 進入 Quix Streams app
+    │
+    ├── SDF pipeline（apply / filter / update）
+    │     └── 錯誤？ → on_processing_error callback
+    │           │       ┌──────────────────────────────────────────┐
+    │           │       │ DLQ_PROCESSING_MODE 決定去向：            │
+    │           │       │  kafka → Kafka DLQ topic                 │
+    │           │       │  doris → Doris error table               │
+    │           │       │  skip  → 跳過，不寫 DLQ                  │
+    │           │       │  crash → app crash，重啟後 replay        │
+    │           │       └──────────────────────────────────────────┘
+    │
+    ├── Checkpoint commit → Sink flush
+    │     └── DorisSink.write() → _stream_load()
+    │           ├── 成功 → 繼續
+    │           ├── Publish Timeout → warning，繼續
+    │           └── 失敗 → DorisSinkException
+    │                 │       ┌──────────────────────────────────────────┐
+    │                 │       │ DLQ_SINK_MODE 決定去向：                  │
+    │                 │       │  kafka → Kafka DLQ topic                 │
+    │                 │       │  doris → Doris error table               │
+    │                 │       │  skip  → 跳過整個 batch，不寫 DLQ        │
+    │                 │       │  crash → app crash，重啟後 replay        │
+    │                 │       └──────────────────────────────────────────┘
+    │
+    └── Side output（SDF 層級，在 sink 之前）
+          sdf.filter(is_invalid).to_topic(dlq_topic)
+```
+
+### 兩層 DLQ 獨立設定
+
+`processing_error` 和 `sink_error` **各自獨立選擇** DLQ 目的地，互不影響：
+
+| 層級 | 環境變數 prefix | 攔截什麼 | mode 選項 |
+|------|----------------|---------|----------|
+| **processing_error** | `DLQ_PROCESSING_*` | SDF pipeline 內 apply/filter/update 拋的異常 | kafka / doris / skip / crash |
+| **sink_error** | `DLQ_SINK_*` | DorisSink Stream Load 失敗 | kafka / doris / skip / crash |
+
+每層的 mode：
+
+| mode | 行為 |
+|------|------|
+| `kafka` | 失敗的 row/batch 寫到 Kafka DLQ topic，pipeline 繼續 |
+| `doris` | 失敗的 row/batch 寫到 Doris error table，pipeline 繼續 |
+| `skip` | 跳過（丟棄），log warning，pipeline 繼續 |
+| `crash` | 不處理，直接 crash app，重啟後從 last committed offset replay |
+
+### Sink DLQ 支援範圍
+
+**`sink_error` DLQ 只對有實作 error callback 的 sink 有效。**
+其他 sink 寫入失敗會直接 crash app，`dlq.sink_error` 的設定對它們無效。
+
+| Sink | sink_error DLQ | 失敗行為 |
+|------|---------------|---------|
+| **DorisSink** | 有效（`on_stream_load_error`） | 根據 `DLQ_SINK_MODE` 處理 |
+| **KafkaSink** | 無效 | 直接 crash，重啟後 replay |
+| **PostgreSQLSink** | 無效 | 直接 crash，重啟後 replay |
+| **其他 community sinks** | 無效 | 直接 crash，重啟後 replay |
+
+`main()` 裡用 `hasattr(sink, '_on_stream_load_error')` 檢查，只對支援的 sink 注入 DLQ handler。
+不支援的 sink 不受影響，行為和沒有 `dlq` 設定時完全一樣。
+
+如果你的 group 同時使用 DorisSink + KafkaSink（fan-out），DorisSink 失敗時走 DLQ 繼續，
+但 KafkaSink 失敗時仍然會 crash。兩者是獨立的 sink instance，互不影響。
+
+`processing_error` 是 Quix Streams 框架層級的 callback（`on_processing_error`），
+跟 sink 類型無關，對所有 sink 都有效 — 因為它攔截的是 SDF pipeline 內的錯誤，
+發生在資料到達 sink 之前。
+
+### `values.yaml` 組合範例
+
+```yaml
+# 範例 1：SDF 錯誤跳過，Sink 錯誤寫 Doris（推薦 CDC 場景）
+dlq:
+  processing_error:
+    mode: skip                     # 格式錯的 message 直接丟棄
+  sink_error:
+    mode: doris                    # Doris 暫時掛了 → 寫 error table
+    doris:
+      host: doris-fe
+      database: error_log
+      table: __dlq_sink
+
+# 範例 2：兩層都走 Kafka DLQ，但寫到不同的 topic
+dlq:
+  processing_error:
+    mode: kafka
+    kafka:
+      topic: dlq.processing       # SDF 錯誤 → 這個 topic
+  sink_error:
+    mode: kafka
+    kafka:
+      topic: dlq.sink             # Sink 錯誤 → 另一個 topic
+
+# 範例 3：兩層都寫到同一張 Doris error table
+dlq:
+  processing_error:
+    mode: doris
+  sink_error:
+    mode: doris
+  shared_doris:                    # 兩層共用同一份 Doris 設定
+    host: doris-fe
+    database: error_log
+    table: __dlq                   # 同一張表，用 source 欄位區分
+    username: root
+    passwordSecretRef:
+      name: quix-passthrough-vault
+      key: doris-dlq-password
+
+# 範例 4：Sink 錯誤直接 crash（at-least-once 最安全）
+dlq:
+  processing_error:
+    mode: skip
+  sink_error:
+    mode: crash                    # Stream Load 失敗 → 停掉，人工介入
+```
+
+### DLQ 寫入格式
+
+**Kafka DLQ topic** — 每筆 message：
+
+```json
+{
+  "failed_table": "ods_orders",
+  "error": "Stream Load failed: Status=Fail, Message=...",
+  "row": {"order_id": 1001, "amount": 99.5, "__key": "k1", ...}
+}
+```
+
+**Doris error table** — 每筆 row：
+
+| 欄位 | 範例 | 說明 |
+|------|------|------|
+| `error_time` | `2025-01-15 10:30:00` | Doris DEFAULT CURRENT_TIMESTAMP |
+| `source` | `sink_error` 或 `processing_error` | 哪一層的錯誤 |
+| `failed_table` | `ods_orders` | 原本要寫入的目標 table |
+| `error_message` | `Stream Load failed: ...` | 完整錯誤訊息 |
+| `row_data` | `{"order_id":1001,...}` | 原始 row 資料 JSON |
+
+後續處理：
+- Kafka DLQ → 另一個 consumer 消費，人工檢查 / 修正 / 重新投入
+- Doris error table → SQL 查詢、Grafana dashboard 接 alert
+- 兩者都可以接 S3/GCS 做長期留存
+
+失敗的 rows 直接寫到 Doris 的 error table，不經過 Kafka。
+適合你希望所有資料（包括 error）都在 Doris 內查詢的場景。
+
+Error table 需要預先建立（Duplicate Key 表，不做 dedup，保留所有 error 記錄）：
+
+```sql
+CREATE TABLE `error_log`.`__dlq` (
+    `error_time`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `failed_table`  VARCHAR(256)    NOT NULL,
+    `error_message` TEXT            NOT NULL,
+    `row_data`      JSON            NOT NULL
+)
+DUPLICATE KEY(`error_time`, `failed_table`)
+DISTRIBUTED BY HASH(`failed_table`) BUCKETS AUTO;
+```
+
+每筆寫入的 error row：
+
+| 欄位 | 值 | 說明 |
+|------|-----|------|
+| `error_time` | `2025-01-15 10:30:00` | Doris DEFAULT CURRENT_TIMESTAMP 自動填入 |
+| `failed_table` | `ods_orders` | 原本要寫入的目標 table |
+| `error_message` | `Stream Load failed: Status=Fail, ...` | 完整錯誤訊息，含 Doris ErrorURL |
+| `row_data` | `{"order_id":1001,"amount":99.5,...}` | 原始 row 資料（JSON） |
+
+查詢 error 記錄：
+
+```sql
+-- 查看最近的 error
+SELECT * FROM error_log.__dlq
+ORDER BY error_time DESC
+LIMIT 100;
+
+-- 查看某張 table 的 error
+SELECT error_time, error_message, JSON_EXTRACT(row_data, '$.order_id') AS order_id
+FROM error_log.__dlq
+WHERE failed_table = 'ods_orders'
+  AND error_time > '2025-01-15';
+
+-- 統計各 table 的 error 數量
+SELECT failed_table, COUNT(*) AS error_count
+FROM error_log.__dlq
+WHERE error_time > NOW() - INTERVAL 1 HOUR
+GROUP BY failed_table
+ORDER BY error_count DESC;
+```
+
+相關環境變數（在 Helm `values.yaml` 的 Deployment env 或 Vault 中設定）：
+
+| 環境變數 | 預設值 | 說明 |
+|---------|--------|------|
+| `DLQ_MODE` | `kafka` | DLQ 模式：`kafka` / `doris` / `none` |
+| `DORIS_DLQ_HOST` | 繼承 `DORIS_HOST` | Error table 所在的 Doris FE host |
+| `DORIS_DLQ_HTTP_PORT` | `8030` | Doris FE HTTP port |
+| `DORIS_DLQ_USERNAME` | `root` | Doris username |
+| `DORIS_DLQ_PASSWORD` | `` | Doris password（建議走 Vault） |
+| `DORIS_DLQ_DATABASE` | `error_log` | Error table 所在的 database |
+| `DORIS_DLQ_TABLE` | `__dlq` | Error table 名稱 |
+
+**重要**：如果 Doris error table 的 Stream Load 也失敗（例如 Doris 整個掛了），
+handler 不會吞錯誤 — 會讓 app crash，避免資料靜默丟失。
+這種情況下 app 重啟後會從 last committed offset 重新消費。
 
 ---
 
