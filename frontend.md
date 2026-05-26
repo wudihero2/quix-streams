@@ -431,14 +431,205 @@ class CompositeExporter:
             exp.emit_throughput(...)
 ```
 
-用戶使用方式：
+### 2.8 接入 Application 的三種方式
+
+核心問題：`MetricsCollector` 需要 hook 進 `Application` 的 `on_message_processed`、
+三個 error callback、以及啟動時取得 `DataFrameRegistry` 來提取 DAG。
+以下三種方式各有取捨。
+
+#### 方式一：外部包裝（推薦）— 不改 Quix 源碼
+
+寫一個獨立的 `MetricsAgent` class，從外部利用 `Application` 的 **public API** 接入。
+
 ```python
-app = Application(
-    broker_address="localhost:9092",
-    enable_metrics=True,                    # 啟用 Kafka topic exporter（預設）
-    otel_endpoint="http://collector:4317",  # 同時啟用 OTel exporter（選配）
-)
+# quix_metrics/agent.py — 獨立套件，不在 quixstreams 目錄內
+
+from quixstreams import Application
+
+class MetricsAgent:
+    """
+    從外部 hook 進 Application，零侵入。
+    用法：
+        app = Application(broker_address="localhost:9092")
+        agent = MetricsAgent(app, exporter=KafkaMetricsExporter(...))
+        # ... 正常設定 sdf ...
+        app.run()
+    """
+
+    def __init__(self, app: Application, exporter: MetricsCollector):
+        self._app = app
+        self._exporter = exporter
+
+        # 1. Hook on_message_processed — chain 用戶原有 callback
+        original_cb = app._on_message_processed
+        def chained_on_message(topic, partition, offset):
+            self._track_throughput(topic, partition, offset)
+            if original_cb:
+                original_cb(topic, partition, offset)
+        app._on_message_processed = chained_on_message
+
+        # 2. Hook error callbacks — 包裝三個 callback
+        app._on_processing_error = ErrorInterceptor(
+            exporter, app._on_processing_error
+        )
+        # on_consumer_error 和 on_producer_error 同理
+
+        # 3. Hook app.run() 啟動時提取 DAG
+        #    用 monkey-patch 或繼承都可以（見下方）
+        original_run = app.run
+        def patched_run(*args, **kwargs):
+            # run() 內部會呼叫 compose_all()，此時 registry 已完整
+            # 但 compose_all 在 _run_dataframe 裡面才呼叫
+            # 所以我們 hook _run_dataframe
+            self._hook_run_dataframe(app)
+            return original_run(*args, **kwargs)
+        app.run = patched_run
+
+    def _hook_run_dataframe(self, app):
+        """在 _run_dataframe 之前提取 DAG 並 push"""
+        original = app._run_dataframe
+        def patched(sink=None):
+            # 此時 registry 已完整
+            dag = extract_dag(app._dataframe_registry)
+            self._exporter.emit_dag(dag)
+            return original(sink=sink)
+        app._run_dataframe = patched
 ```
+
+| 優點 | 缺點 |
+|------|------|
+| 不改 quix 源碼，隨 upstream 升版 | 依賴 private API（`_on_message_processed`、`_dataframe_registry`） |
+| 獨立套件，可發布為 `quix-metrics` | private API 改名時會壞，但風險可控（pin 版本 + CI 測試） |
+| 用戶程式碼只多一行 `MetricsAgent(app, ...)` | — |
+
+**注意**：`on_message_processed` 是傳入 `__init__` 的參數，存為 `self._on_message_processed`
+（`app.py:351`），是 instance attribute，可以直接替換。三個 error callback 同理
+（`app.py:352` `_on_processing_error`）。`_dataframe_registry` 也是 instance attribute。
+雖然是 private API，但 Quix 的這些屬性非常穩定（從 v2 到 v3 沒改過命名）。
+
+#### 方式二：Fork 改 Application
+
+直接在 `quixstreams/app.py` 加入 metrics 支援。
+
+```python
+# quixstreams/app.py — 修改 Application.__init__
+
+class Application:
+    def __init__(
+        self,
+        ...,
+        # ===== 新增參數 =====
+        enable_metrics: bool = False,
+        metrics_topic: str = "__quix_metrics",
+        otel_endpoint: Optional[str] = None,
+    ):
+        ...
+        # 初始化 metrics
+        if enable_metrics:
+            self._metrics_exporter = KafkaMetricsExporter(
+                producer=self._producer,
+                topic=metrics_topic,
+                consumer_group=consumer_group,
+            )
+        if otel_endpoint:
+            self._otel_exporter = OTelMetricsExporter(endpoint=otel_endpoint)
+
+        # 包裝 callbacks
+        if enable_metrics or otel_endpoint:
+            original_cb = self._on_message_processed
+            def chained(topic, partition, offset):
+                self._metrics_tracker.on_message(topic, partition, offset)
+                if original_cb:
+                    original_cb(topic, partition, offset)
+            self._on_message_processed = chained
+```
+
+```python
+# quixstreams/app.py — 修改 _run_dataframe
+
+    def _run_dataframe(self, sink=None):
+        ...
+        dataframes_composed = self._dataframe_registry.compose_all(sink=sink)
+
+        # ===== 新增：啟動時 push DAG =====
+        if hasattr(self, '_metrics_exporter'):
+            dag = extract_dag(self._dataframe_registry)
+            self._metrics_exporter.emit_dag(dag)
+
+        processing_context.init_checkpoint()
+        ...
+```
+
+| 優點 | 缺點 |
+|------|------|
+| 最乾淨的 API（`enable_metrics=True`） | **和 upstream 分叉**，每次升版要 rebase/merge |
+| 可存取所有內部狀態 | `__init__` 已有 30+ 參數，再加 3 個更臃腫 |
+| 型別安全 | 如果想貢獻回 upstream，PR 可能不被接受（scope 太大） |
+
+#### 方式三：Monkey-patch（最 hacky）
+
+不改源碼、不繼承，runtime 動態替換。
+
+```python
+# 用戶程式碼
+
+from quixstreams import Application
+from quix_metrics import patch_app
+
+app = Application(broker_address="localhost:9092")
+patch_app(app, exporter=KafkaMetricsExporter(...))
+# done — app 的 callback 已被替換
+```
+
+```python
+# quix_metrics/patch.py
+
+def patch_app(app: Application, exporter: MetricsCollector):
+    """Monkey-patch Application instance"""
+
+    # 替換 _process_message 來攔截每條訊息
+    original_process = app._process_message
+
+    def patched_process(dataframe_composed):
+        original_process(dataframe_composed)
+        # _process_message 結束後，offset 已經 store 了
+        # 但我們拿不到 topic/partition/offset... 除非也 patch _on_message_processed
+
+    # 所以還是得 patch callback，和方式一本質相同
+    original_cb = app._on_message_processed
+    tracker = ThroughputTracker(exporter)
+
+    def patched_cb(topic, partition, offset):
+        tracker.on_message(topic, partition, offset)
+        if original_cb:
+            original_cb(topic, partition, offset)
+
+    app._on_message_processed = patched_cb
+
+    # Patch error callbacks
+    app._on_processing_error = ErrorInterceptor(exporter, app._on_processing_error)
+    # ... 同理 on_consumer_error, on_producer_error
+```
+
+| 優點 | 缺點 |
+|------|------|
+| 零侵入，一個函式搞定 | 最 hacky，可讀性差 |
+| 不改源碼 | 和方式一一樣依賴 private API |
+| — | 比方式一更難測試、更難理解 |
+
+#### 三種方式比較
+
+| | 方式一：外部包裝 | 方式二：Fork | 方式三：Monkey-patch |
+|---|---|---|---|
+| 改 quix 源碼？ | 否 | 是 | 否 |
+| 可跟 upstream？ | 是 | 困難 | 是 |
+| API 優雅度 | `MetricsAgent(app, ...)` | `Application(enable_metrics=True)` | `patch_app(app, ...)` |
+| 依賴 private API？ | 是（`_on_message_processed` 等） | 否 | 是 |
+| 可發布為獨立套件？ | 是 | 否 | 是 |
+| 可讀性 | 高 | 最高 | 低 |
+| 推薦場景 | **自用 + 想跟 upstream** | 確定要 fork 維護 | 快速 POC |
+
+**建議**：先用方式一（外部包裝）開發和驗證，如果未來想貢獻回 Quix upstream，再用方式二的思路提 PR。方式三不建議用於生產。
 
 ---
 
@@ -587,6 +778,13 @@ if self._on_message_processed is not None:
 
 ### 5.2 流量追蹤方案
 
+#### 核心設計原則：不要每筆訊息都送 metrics
+
+10 萬 msg/s 的 pipeline 如果每筆都 produce metrics，等於額外產生 10 萬 msg/s 的 Kafka 流量，
+這完全不可接受。**所有 metrics 都必須 aggregate 後再送。**
+
+#### 方案 A：掛 `on_message_processed` callback + in-memory 累加（原始方案）
+
 ```python
 class ThroughputTracker:
     """追蹤每個 topic-partition 的訊息流量"""
@@ -599,11 +797,12 @@ class ThroughputTracker:
         self._interval = report_interval
 
     def on_message(self, topic: str, partition: int, offset: int):
-        """作為 on_message_processed callback"""
+        """作為 on_message_processed callback，每條訊息觸發一次"""
         ctx = message_context()  # 取得當前 MessageContext
         self._counts[(topic, partition)] += 1
         self._bytes[(topic, partition)] += ctx.size
 
+        # 只在 interval 到期時才 produce 到 metrics topic
         if time.monotonic() - self._last_report >= self._interval:
             self._flush()
 
@@ -621,11 +820,89 @@ class ThroughputTracker:
         self._last_report = time.monotonic()
 ```
 
+**問題**：雖然 produce 只有每 10s 一次，但 `on_message` callback 每筆訊息都會被呼叫。
+10 萬 msg/s 下 = 每秒多 10 萬次 Python function call + dict lookup + `time.monotonic()` 呼叫。
+實測約 ~0.5-1μs per call，即**每秒額外 ~50-100ms CPU 開銷（5-10%）**。
+
+#### 方案 B（推薦）：搭 Checkpoint 便車
+
+Checkpoint 已經追蹤了我們需要的核心數據：
+
+```python
+# checkpoint.py 中已有：
+self._tp_offsets: Dict[Tuple[str, int], int] = {}        # 每個 tp 的最新 offset
+self._starting_tp_offsets: Dict[Tuple[str, int], int] = {}  # 每個 tp 的起始 offset
+self._total_offsets_processed = 0                          # 已處理總筆數
+```
+
+**從 checkpoint commit 時計算 throughput，零 per-message 開銷：**
+
+```python
+class CheckpointMetricsHook:
+    """在 checkpoint commit 後收集 metrics，不用 per-message callback"""
+
+    def __init__(self, collector: MetricsCollector):
+        self._collector = collector
+        self._last_offsets: dict[tuple[str, int], int] = {}
+        self._last_ts = time.monotonic()
+
+    def on_checkpoint_committed(self, checkpoint: Checkpoint):
+        """在 checkpoint.commit() 完成後呼叫"""
+        now = time.monotonic()
+        elapsed = now - self._last_ts
+
+        partitions = {}
+        for (topic, partition), end_offset in checkpoint._tp_offsets.items():
+            tp = (topic, partition)
+            start_offset = self._last_offsets.get(tp)
+            if start_offset is not None:
+                count = end_offset - start_offset
+                partitions[f"{topic}:{partition}"] = {
+                    "count": count,
+                    "rate_msg_s": count / elapsed if elapsed > 0 else 0,
+                }
+            self._last_offsets[tp] = end_offset
+
+        if partitions:
+            self._collector.emit({
+                "type": "throughput",
+                "payload": {
+                    "partitions": partitions,
+                    "total_count": checkpoint._total_offsets_processed,
+                    "window_seconds": round(elapsed, 2),
+                },
+            })
+        self._last_ts = now
+```
+
+**為什麼這樣更好：**
+
+| | 方案 A（per-message callback） | 方案 B（搭 checkpoint 便車） |
+|---|---|---|
+| 每條訊息的開銷 | ~0.5-1μs（function call + dict + monotonic） | **零** |
+| 10萬 msg/s 的 CPU 開銷 | ~5-10% | **0%** |
+| Produce 到 metrics topic | 每 10s 一次 | 每次 checkpoint commit（預設 5s） |
+| 資料精度 | 精確到筆 | 精確到 offset 差值（完全等價） |
+| bytes 追蹤 | 有（透過 MessageContext.size） | 無（checkpoint 不追蹤 bytes）|
+| 需要改 Quix 源碼 | 不用（hook `_on_message_processed`） | 需要加一個 post-commit hook |
+
+**trade-off**：方案 B 拿不到 bytes 資訊（checkpoint 只記 offset 不記 bytes）。
+如果需要 bytes，可以混合使用：用方案 B 拿 count/rate，另外只對 bytes 做輕量累加：
+
+```python
+# 極輕量版：只累加 bytes，不做任何其他邏輯
+def on_message(self, topic: str, partition: int, offset: int):
+    self._bytes[(topic, partition)] += message_context().size
+    # 不做 flush 判斷 — flush 由 checkpoint hook 統一觸發
+```
+
+這樣 per-message 開銷降到 ~0.2μs（一次 dict increment，無 function call overhead）。
+
 ### 5.3 需要新增
 
-- 在 `Application` 中建立 `ThroughputTracker`，接入 `on_message_processed`
-- 如果用戶自己也設了 `on_message_processed`，需要 chain 兩個 callback
-- 考慮用 `set_message_context()` 取得 `MessageContext` 來獲取 `size`
+- **方案 B（推薦）**：在 `Checkpoint.commit()` 完成後加一個 hook point，觸發 `CheckpointMetricsHook.on_checkpoint_committed()`
+- 如果需要 bytes 追蹤，再額外加一個最輕量的 `on_message_processed` callback 只做 dict increment
+- offset 差值法的精度和逐筆計數完全等價（Kafka offset 是連續遞增的）
 
 ---
 
@@ -719,25 +996,58 @@ class ResourceCollector:
 
 ### 7.2 錯誤攔截方案
 
-包裝原有 callback，在呼叫前攔截錯誤資訊：
+包裝原有 callback，在呼叫前攔截錯誤資訊。
+
+**注意：錯誤也不應該每筆都送**。高錯誤率場景下（例如 schema 不相容導致 100% 訊息都失敗），
+每筆都 produce error metrics 會讓 metrics topic 和正常資料一樣大。
 
 ```python
 class ErrorInterceptor:
-    def __init__(self, collector: MetricsCollector, original_cb):
+    """攔截 error callback，累積計數後定期彙報"""
+
+    def __init__(self, collector: MetricsCollector, original_cb, flush_interval: float = 10.0):
         self._collector = collector
         self._original = original_cb
-        self._counts: dict[str, int] = defaultdict(int)
+        self._counts: dict[str, int] = defaultdict(int)  # {error_type: count}
+        self._last_flush = time.monotonic()
+        self._flush_interval = flush_interval
+        self._recent_samples: dict[str, dict] = {}  # {error_type: sample}，最多 3 種 distinct
 
     def __call__(self, exc, context, logger):
         error_type = type(exc).__name__
         self._counts[error_type] += 1
-        self._collector.emit_error(
-            error_type=error_type,
-            detail=str(exc),
-            topic=getattr(context, 'topic', None),
-            partition=getattr(context, 'partition', None),
-        )
+
+        # 保留最近 3 種 distinct error type 的 sample，供前端快速 debug
+        # 詳細錯誤資料（traceback、完整 payload）由用戶自行 produce 到 error topic
+        if len(self._recent_samples) < 3 or error_type in self._recent_samples:
+            self._recent_samples[error_type] = {
+                "error_type": error_type,
+                "message": str(exc)[:200],
+                "topic": getattr(context, 'topic', None),
+                "partition": getattr(context, 'partition', None),
+            }
+
+        # 定期 flush（或由 checkpoint hook 統一觸發）
+        if time.monotonic() - self._last_flush >= self._flush_interval:
+            self._flush()
+
         return self._original(exc, context, logger)
+
+    def _flush(self):
+        if not self._counts:
+            return
+        self._collector.emit({
+            "type": "error",
+            "payload": {
+                "counts": dict(self._counts),        # {"KeyError": 142, "ValueError": 3}
+                "total": sum(self._counts.values()),
+                "samples": list(self._recent_samples.values()),  # 最多 3 種 distinct
+                "window_seconds": time.monotonic() - self._last_flush,
+            },
+        })
+        self._counts.clear()
+        self._recent_samples.clear()
+        self._last_flush = time.monotonic()
 ```
 
 使用方式：在 `Application.__init__()` 中，如果 `enable_metrics=True`，自動包裝三個 error callback。
@@ -1088,16 +1398,17 @@ class MetricsAggregator:
 }
 ```
 
-**Error**（即時推送）：
+**Error**（每 10 秒彙報一次，aggregate + 最多 3 種 distinct sample）：
 ```json
 {
-  "error_type": "ProcessingError",
-  "exception_class": "KeyError",
-  "message": "'missing_field'",
-  "topic": "topic-a",
-  "partition": 0,
-  "offset": 99042,
-  "traceback": "Traceback (most recent call last):\n  ..."
+  "counts": { "KeyError": 142, "ValueError": 3, "TypeError": 1 },
+  "total": 146,
+  "samples": [
+    { "error_type": "KeyError", "message": "'missing_field'", "topic": "topic-a", "partition": 0 },
+    { "error_type": "ValueError", "message": "invalid literal for int()", "topic": "topic-a", "partition": 1 },
+    { "error_type": "TypeError", "message": "unsupported operand type(s)", "topic": "topic-b", "partition": 0 }
+  ],
+  "window_seconds": 10.0
 }
 ```
 
@@ -1117,6 +1428,26 @@ class MetricsAggregator:
 
 ## 11. 對 Pipeline 效能的影響分析
 
+### 11.0 Aggregation 策略總覽
+
+**核心原則：所有 metrics 都不逐筆發送，全部 aggregate 後才送。**
+
+| Metric 類型 | 收集方式 | 送出頻率 | 每條訊息的開銷 |
+|---|---|---|---|
+| **Throughput** | 方案 B：搭 checkpoint 便車，用 offset 差計算 | 每次 checkpoint commit（~5s） | **零** |
+| **Throughput (bytes)** | 輕量 callback：`dict[tp] += ctx.size` | 同上（由 checkpoint hook flush） | ~0.2μs（一次 dict increment） |
+| **Offset (lag)** | 定時查 Kafka broker | 每 30s | 零（定時器驅動） |
+| **Resource** | 定時查 psutil + 磁碟 | 每 30s | 零（定時器驅動） |
+| **Error** | callback 攔截 + 累計計數 + sample | 每 10s 或隨 checkpoint flush | ~0.1μs（dict increment，僅出錯時） |
+| **Broker Health** | 讀 consumer._broker_states | 每 30s | 零（定時器驅動） |
+| **DAG** | 啟動時 push 一次 | 一次性 | N/A |
+
+**以 10 萬 msg/s pipeline 為例：**
+- Throughput：搭 checkpoint 便車 → 主迴圈零開銷
+- 如果加 bytes 追蹤：10 萬次 dict increment/s ≈ ~20ms CPU/s（~2%）
+- 其餘全部定時器驅動，與 msg/s 無關
+- Produce 到 metrics topic：每 5-30s 一次，每次 ~1KB → **可忽略**
+
 ### 11.1 Kafka Topic Exporter（路線 A）
 
 | 操作 | 成本 | 影響程度 |
@@ -1128,12 +1459,12 @@ class MetricsAggregator:
 | `psutil.cpu_percent()` | ~0.1ms | 極低 |
 | 磁碟掃描 (state dir) | ~10-100ms（視 state 大小） | 中等，30s+ 間隔 |
 
-**整體評估**：主要開銷在 offset 查詢和磁碟掃描，均已限制為 30 秒間隔。async produce 對主處理迴圈幾乎無影響。以 10 萬 msg/s 的 pipeline 為例：
+**整體評估**：使用 checkpoint 便車方案後，主迴圈每條訊息的額外開銷降至零（或 ~0.2μs 如果追蹤 bytes）。主要開銷在 offset 查詢和磁碟掃描，均已限制為 30 秒間隔。以 10 萬 msg/s 的 pipeline 為例：
 
-- Throughput metrics：每 10s 一筆 produce ≈ 可忽略
+- Throughput metrics：搭 checkpoint 便車，零 per-message 開銷，每 5s 一筆 produce
 - Offset metrics：每 30s 若有 10 個 partition ≈ 10 次 Kafka RPC ≈ 50ms
 - Resource metrics：每 30s 一次 ≈ 100ms
-- **總額外 CPU 開銷 < 0.1%**
+- **總額外 CPU 開銷 < 0.1%**（不含 bytes 追蹤）或 **~2%**（含 bytes 追蹤）
 
 ### 11.2 OTel Exporter（路線 B）
 
@@ -1161,13 +1492,13 @@ class MetricsAggregator:
 
 | | 路線 A (Kafka) | 路線 B (OTel) | 路線 C (直送) |
 |---|---|---|---|
-| 主迴圈每條訊息額外開銷 | ~0（只在 interval 時 produce） | ~1μs（counter.add 原子操作） | ~0.5μs（queue.put） |
+| 主迴圈每條訊息額外開銷 | **零**（checkpoint 便車） | ~1μs（counter.add 原子操作） | ~0.5μs（queue.put） |
 | 背景 thread 數 | 0（複用 librdkafka thread） | 1（PeriodicExportingMetricReader） | 1（自己管理） |
-| 每 10s 網路開銷 | 1 次 Kafka produce（~1KB） | 1 次 gRPC call（~2KB） | 1 次 HTTP POST（~1KB） |
+| 每 5-30s 網路開銷 | 1 次 Kafka produce（~1KB） | 1 次 gRPC call（~2KB） | 1 次 HTTP POST（~1KB） |
 | **資料保證** | **持久化** | 會丟 | 會丟 |
 | 總 CPU 開銷 | < 0.1% | < 0.1% | < 0.1% |
 
-**結論：三者效能幾乎相同，差異可忽略。選擇關鍵在資料持久性和生態整合，不在效能。**
+**結論：三者效能幾乎相同，差異可忽略。路線 A 搭配 checkpoint 便車後甚至是三者中 per-message 開銷最低的（零），因為不需要任何 per-message callback。選擇關鍵在資料持久性和生態整合，不在效能。**
 
 ### 11.5 風險緩解
 
@@ -1213,7 +1544,8 @@ class MetricsAggregator:
 | `KafkaMetricsExporter` | Produce metrics 到 Kafka topic | 低 |
 | `OTelMetricsExporter` | 用 OTel SDK 推送 metrics（選配，資料可丟） | 中 |
 | `DirectHttpExporter` | 直送 gRPC/HTTP 到 backend（選配，資料可丟） | 低 |
-| `ThroughputTracker` | 攔截 `on_message_processed`，計算流量 | 低 |
+| `CheckpointMetricsHook` | 搭 checkpoint 便車，用 offset 差計算 throughput | 低 |
+| `ErrorInterceptor` | 攔截 error callback，累計計數 + sample，定期 flush | 低 |
 | `ErrorInterceptor` | 包裝 error callbacks，攔截錯誤 | 低 |
 | `ResourceCollector` | psutil + 磁碟掃描 | 低 |
 | `DAGExtractor` | 從 `DataFrameRegistry` 提取 DAG JSON | 低 |

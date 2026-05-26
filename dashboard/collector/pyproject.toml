@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quix-metrics"
+version = "0.1.0"
+description = "Metrics collector for Quix Streams monitoring dashboard"
+requires-python = ">=3.9"
+dependencies = [
+    "confluent-kafka>=2.0.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-mock>=3.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quix_metrics*"]
