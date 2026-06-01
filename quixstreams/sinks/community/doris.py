@@ -413,6 +413,11 @@ def _serialize_headers(headers: HeadersTuples) -> dict[str, str | None]:
 def _orjson_default(obj: Any) -> Any:
     if isinstance(obj, Decimal):
         return str(obj)
+    # orjson does NOT serialize bytes natively. Kafka keys (and some values)
+    # arrive as bytes when no str deserializer is used, so decode them the same
+    # way _serialize_headers handles bytes header values.
+    if isinstance(obj, (bytes, bytearray)):
+        return bytes(obj).decode("utf-8", errors="replace")
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 

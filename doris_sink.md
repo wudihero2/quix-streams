@@ -919,15 +919,21 @@ bytes 值 decode 成 UTF-8，無法 decode 的用 `�` 取代。
 def _orjson_default(obj: Any) -> Any:
     if isinstance(obj, Decimal):
         return str(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        return bytes(obj).decode("utf-8", errors="replace")
     raise TypeError(...)
 ```
 
-orjson 的 `default` callback，只需處理 `Decimal`。
+orjson 的 `default` callback，處理 `Decimal` 和 `bytes`。
 其他型別 orjson 原生支援：
 - `datetime` → ISO 格式（自動處理時區）
 - `int`, `float`, `str`, `bool`, `None` → 原生 JSON
 - `list`, `dict` → 遞迴序列化
-- `bytes` 和 `UUID` → orjson 也原生支援
+- `UUID` → orjson 原生支援
+
+注意：orjson **不**原生序列化 `bytes`（會丟 `TypeError`）。Kafka 的 key 在沒有設
+`key_deserializer="str"` 時是 `bytes`，所以 `_orjson_default` 比照 `_serialize_headers`
+把 `bytes`/`bytearray` decode 成 UTF-8 字串（無法 decode 的字元用 `�` 取代）。
 
 比之前用標準 `json` 時的 `_json_serializer` 精簡很多。
 

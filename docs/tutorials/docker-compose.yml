@@ -7,12 +7,15 @@ services:
     hostname: broker
     container_name: broker
     ports:
-      - "9092:9092"
+      - "9094:9094"
       - "9101:9101"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092'
+      # Advertise 127.0.0.1 (not localhost): on macOS localhost resolves to IPv6
+      # ::1 first, but Kafka only listens on IPv4, so clients waste a connect
+      # retry on ::1 before falling back. 127.0.0.1 connects straight away.
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://broker:29092,PLAINTEXT_HOST://127.0.0.1:9094'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -21,7 +24,7 @@ services:
       KAFKA_JMX_HOSTNAME: localhost
       KAFKA_PROCESS_ROLES: 'broker,controller'
       KAFKA_CONTROLLER_QUORUM_VOTERS: '1@broker:29093'
-      KAFKA_LISTENERS: 'PLAINTEXT://broker:29092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_LISTENERS: 'PLAINTEXT://broker:29092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:9094'
       KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
       KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
@@ -42,24 +45,20 @@ services:
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'broker:29092'
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
 
-  control-center:
-    image: confluentinc/cp-enterprise-control-center:7.5.0
-    hostname: control-center
-    container_name: control-center
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    hostname: kafka-ui
+    container_name: kafka-ui
     depends_on:
       - broker
       - schema-registry
     ports:
-      - "9021:9021"
+      - "9021:8080"
     environment:
-      CONTROL_CENTER_BOOTSTRAP_SERVERS: 'broker:29092'
-      CONTROL_CENTER_CONNECT_CONNECT-DEFAULT_CLUSTER: 'connect:8083'
-      CONTROL_CENTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
-      CONTROL_CENTER_REPLICATION_FACTOR: 1
-      CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
-      CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
-      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
-      PORT: 9021
+      KAFKA_CLUSTERS_0_NAME: 'local'
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: 'broker:29092'
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: 'http://schema-registry:8081'
+      DYNAMIC_CONFIG_ENABLED: 'true'
 
   rest-proxy:
     image: confluentinc/cp-kafka-rest:7.5.0
@@ -75,3 +74,158 @@ services:
       KAFKA_REST_BOOTSTRAP_SERVERS: 'broker:29092'
       KAFKA_REST_LISTENERS: "http://0.0.0.0:8082"
       KAFKA_REST_SCHEMA_REGISTRY_URL: 'http://schema-registry:8081'
+
+  postgres:
+    image: postgres:16
+    hostname: postgres
+    container_name: postgres
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: quixstreams
+      POSTGRES_PASSWORD: quixstreams
+      POSTGRES_DB: quixstreams
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Pre-creates the word-counts table on first startup.
+      - ./word-count/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quixstreams"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Doris BE refuses to start unless the (shared Docker Desktop VM) kernel has
+  # vm.max_map_count >= 2000000. This one-shot privileged container sets it
+  # before the BE starts. Runs once and exits.
+  doris-init:
+    image: busybox
+    container_name: doris-init
+    command: sh -c "sysctl -w vm.max_map_count=2000000"
+    privileged: true
+
+  # Real 3 FE + 3 BE HA cluster (Doris 4.0.x). All FEs share the SAME FE_SERVERS
+  # list (the cluster's full FE membership) but get a distinct FE_ID; fe1 (ID 1)
+  # bootstraps as master, fe2/fe3 join as followers. Each BE self-registers with
+  # its own BE_ADDR. Self-registration needs predictable IPs, so every node has a
+  # static address on the fixed-subnet network (doris-net).
+  #
+  #   IP map (10.80.80.0/24):  fe1 .2  fe2 .3  fe3 .4   be1 .5  be2 .6  be3 .7
+  #
+  # Only fe1 (8030/9030) and be1 (8040) are published to the host — that's enough
+  # to drive the cluster from the host; the rest talk over doris-net.
+
+  doris-fe1:
+    image: apache/doris:fe-4.0.5
+    hostname: doris-fe1
+    container_name: doris-fe1
+    depends_on:
+      doris-init:
+        condition: service_completed_successfully
+    environment:
+      - FE_SERVERS=fe1:10.80.80.2:9010,fe2:10.80.80.3:9010,fe3:10.80.80.4:9010
+      - FE_ID=1
+    ports:
+      - "8030:8030"   # FE HTTP  — web UI + Stream Load entrypoint (redirects to a BE)
+      - "9030:9030"   # FE MySQL — connect a mysql client to create DB/tables and query
+    networks:
+      doris-net:
+        ipv4_address: 10.80.80.2
+    volumes:
+      - doris-fe1-meta:/opt/apache-doris/fe/doris-meta
+
+  doris-fe2:
+    image: apache/doris:fe-4.0.5
+    hostname: doris-fe2
+    container_name: doris-fe2
+    depends_on:
+      - doris-fe1
+    environment:
+      - FE_SERVERS=fe1:10.80.80.2:9010,fe2:10.80.80.3:9010,fe3:10.80.80.4:9010
+      - FE_ID=2
+    networks:
+      doris-net:
+        ipv4_address: 10.80.80.3
+    volumes:
+      - doris-fe2-meta:/opt/apache-doris/fe/doris-meta
+
+  doris-fe3:
+    image: apache/doris:fe-4.0.5
+    hostname: doris-fe3
+    container_name: doris-fe3
+    depends_on:
+      - doris-fe1
+    environment:
+      - FE_SERVERS=fe1:10.80.80.2:9010,fe2:10.80.80.3:9010,fe3:10.80.80.4:9010
+      - FE_ID=3
+    networks:
+      doris-net:
+        ipv4_address: 10.80.80.4
+    volumes:
+      - doris-fe3-meta:/opt/apache-doris/fe/doris-meta
+
+  doris-be1:
+    image: apache/doris:be-4.0.5
+    hostname: doris-be1
+    container_name: doris-be1
+    depends_on:
+      - doris-fe1
+    environment:
+      - FE_SERVERS=fe1:10.80.80.2:9010,fe2:10.80.80.3:9010,fe3:10.80.80.4:9010
+      - BE_ADDR=10.80.80.5:9050
+    ports:
+      # BE webserver. Send Stream Load straight here from the host to skip the
+      # FE->BE redirect (FE would redirect to a 10.80.80.x BE, unreachable from host).
+      - "8040:8040"
+    networks:
+      doris-net:
+        ipv4_address: 10.80.80.5
+    volumes:
+      - doris-be1-storage:/opt/apache-doris/be/storage
+
+  doris-be2:
+    image: apache/doris:be-4.0.5
+    hostname: doris-be2
+    container_name: doris-be2
+    depends_on:
+      - doris-fe1
+    environment:
+      - FE_SERVERS=fe1:10.80.80.2:9010,fe2:10.80.80.3:9010,fe3:10.80.80.4:9010
+      - BE_ADDR=10.80.80.6:9050
+    networks:
+      doris-net:
+        ipv4_address: 10.80.80.6
+    volumes:
+      - doris-be2-storage:/opt/apache-doris/be/storage
+
+  doris-be3:
+    image: apache/doris:be-4.0.5
+    hostname: doris-be3
+    container_name: doris-be3
+    depends_on:
+      - doris-fe1
+    environment:
+      - FE_SERVERS=fe1:10.80.80.2:9010,fe2:10.80.80.3:9010,fe3:10.80.80.4:9010
+      - BE_ADDR=10.80.80.7:9050
+    networks:
+      doris-net:
+        ipv4_address: 10.80.80.7
+    volumes:
+      - doris-be3-storage:/opt/apache-doris/be/storage
+
+networks:
+  doris-net:
+    ipam:
+      config:
+        # 10.80.80.0/24 — avoids the 172.x ranges Docker's default bridge networks
+        # already use (incl. this project's own tutorials_default on 172.20.0.0/16).
+        - subnet: 10.80.80.0/24
+
+volumes:
+  postgres-data:
+  doris-fe1-meta:
+  doris-fe2-meta:
+  doris-fe3-meta:
+  doris-be1-storage:
+  doris-be2-storage:
+  doris-be3-storage:
