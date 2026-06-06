@@ -331,24 +331,94 @@ def make_processing_error_handler(dlq_handler):
     return handler
 
 
+def _safe_decode(b):
+    """raw Kafka key/value 是 bytes，orjson 不能直接序列化 → 盡力 decode 成 str。"""
+    if isinstance(b, (bytes, bytearray)):
+        return bytes(b).decode("utf-8", errors="replace")
+    return b
+
+
+def make_consumer_error_handler(dlq_handler):
+    """建立 on_consumer_error callback（poll / 反序列化階段）。
+
+    這層攔的是「訊息進 SDF 之前」就失敗的錯誤（例如壞掉的 JSON、schema 不符）。
+    此時還沒有 Row，只有 raw message（bytes），所以盡力 decode 後寫 DLQ。
+    回 True = 跳過該筆壞訊息、繼續；回 False = crash（重啟後 replay → 可能 crash-loop）。
+    """
+    if dlq_handler is None:
+        return lambda exc, message, log: False  # crash
+
+    def handler(exc, message, log):
+        try:
+            row_data = {
+                "topic": message.topic() if message else None,
+                "partition": message.partition() if message else None,
+                "offset": message.offset() if message else None,
+                "value": _safe_decode(message.value()) if message else None,
+                "key": _safe_decode(message.key()) if message else None,
+            }
+            dlq_handler(table="__consumer_error", rows=[row_data], exception=exc)
+        except Exception as dlq_exc:
+            log.error(f"Failed to write consumer error to DLQ: {dlq_exc}")
+            return False  # DLQ 也失敗 → crash
+        return True  # 寫 DLQ 成功 → 跳過該筆壞訊息
+
+    return handler
+
+
+def make_producer_error_handler(dlq_handler):
+    """建立 on_producer_error callback（序列化 / produce 到 Kafka 階段）。
+
+    這層攔的是 to_topic() / changelog 寫 Kafka 時序列化或投遞失敗。
+    此時是 Row（已反序列化的物件），跟 processing_error 一樣取 value/key。
+    """
+    if dlq_handler is None:
+        return lambda exc, row, log: False  # crash
+
+    def handler(exc, row, log):
+        try:
+            row_data = {"value": row.value, "key": row.key} if row else {}
+            dlq_handler(table="__producer_error", rows=[row_data], exception=exc)
+        except Exception as dlq_exc:
+            log.error(f"Failed to write producer error to DLQ: {dlq_exc}")
+            return False  # DLQ 也失敗 → crash
+        return True  # 寫 DLQ 成功 → 跳過該筆
+
+    return handler
+
+
 def main():
     group_config = load_group_config()
     group_name = os.environ["GROUP_NAME"]
 
-    # ── 建立兩層 DLQ handlers ──
-    # 先建 app（不帶 on_processing_error），再建 handler，最後注入
+    # ── 建立四層 DLQ handlers ──
+    # on_consumer_error / on_producer_error 必須在「建構 Application 時」就傳入：
+    # 它們會被綁進 internal consumer / producer，事後再改屬性沒有用。
+    # 但 DLQ handler 需要 app（kafka mode 會用 app.get_producer()），形成雞生蛋。
+    # 解法：建構時先傳 late-bound 包裝 lambda，app 建好後再填真正的 handler。
+    # （這兩個 callback 只在 app.run() 期間被呼叫，那時 handler 早已填好。）
+    _consumer_error = None
+    _producer_error = None
+
     app = Application(
         broker_address=os.environ["BROKER_ADDRESS"],
         consumer_group=f"passthrough-{group_name}",
         auto_offset_reset="earliest",
         loglevel=os.environ.get("LOG_LEVEL", "INFO"),
+        # consumer/producer 階段的錯誤（反序列化 / produce 失敗）
+        on_consumer_error=lambda exc, msg, log: _consumer_error(exc, msg, log),
+        on_producer_error=lambda exc, row, log: _producer_error(exc, row, log),
     )
 
     processing_dlq = build_dlq_handler("PROCESSING", app, "processing")
     sink_dlq = build_dlq_handler("SINK", app, "sink")
+    consumer_dlq = build_dlq_handler("CONSUMER", app, "consumer")
+    producer_dlq = build_dlq_handler("PRODUCER", app, "producer")
 
-    # 注入 on_processing_error
+    # on_processing_error 可事後注入；consumer/producer 填回上面 late-bound 的洞
     app._on_processing_error = make_processing_error_handler(processing_dlq)
+    _consumer_error = make_consumer_error_handler(consumer_dlq)
+    _producer_error = make_producer_error_handler(producer_dlq)
 
     # default_sinks 支援單一 dict 或 list（fan-out）
     default_sinks = group_config.get("default_sinks") or group_config["default_sink"]
@@ -414,18 +484,29 @@ resources:
     cpu: 500m
 
 # ── DLQ 設定 ──────────────────────────────────────────────────
-# 兩層錯誤各自獨立選擇 DLQ 目的地：
+# 四層錯誤各自獨立選擇 DLQ 目的地：
+#   consumer_error   — poll / 反序列化錯誤（訊息進 SDF 之前就壞，如髒 JSON）
 #   processing_error — SDF pipeline 內的錯誤（apply/filter/update 拋異常）
+#   producer_error   — 序列化 / produce 到 Kafka 失敗（to_topic / changelog）
 #   sink_error       — Sink flush 失敗（Stream Load / DB write 錯誤）
 #
 # 每層的 mode：kafka | doris | skip | crash
 #   kafka — 寫到 Kafka DLQ topic
 #   doris — 寫到 Doris error table
 #   skip  — 跳過該筆/該 batch，不寫 DLQ，pipeline 繼續（靜默丟棄）
-#   crash — 不處理，直接 crash app（重啟後 replay）
+#   crash — 不處理，直接 crash app（重啟後 replay；預設）
 #
-# 兩層可以指向同一個目的地，也可以各走各的。
+# 每層可以指向同一個目的地，也可以各走各的。沒寫的層 = 預設 crash。
 dlq:
+  # ── poll / 反序列化錯誤（on_consumer_error）──
+  # 訊息在進 SDF 之前就壞掉（解析不出 Row）。這是反序列化錯誤的唯一攔截點，
+  # processing_error 的 DLQ 攔不到。skip/kafka/doris = 跳過該筆壞訊息繼續；
+  # crash = 整條 pipeline 停在這筆（重啟 replay → 同筆再炸 → CrashLoopBackOff）。
+  consumer_error:
+    mode: skip                         # kafka | doris | skip | crash（建議 skip 或 kafka）
+    # kafka:
+    #   topic: "dlq.consumer-errors"
+
   # ── SDF pipeline 錯誤（on_processing_error）──
   # apply/filter/update 拋異常時，該筆 message 怎麼處理
   processing_error:
@@ -437,6 +518,13 @@ dlq:
     #   http_port: 8030
     #   database: error_log
     #   table: __dlq_processing
+
+  # ── produce 到 Kafka 錯誤（on_producer_error）──
+  # to_topic() / changelog 寫 Kafka 時序列化或投遞失敗
+  producer_error:
+    mode: crash                        # kafka | doris | skip | crash
+    # kafka:
+    #   topic: "dlq.producer-errors"
 
   # ── Sink flush 錯誤（on_stream_load_error）──
   # DorisSink Stream Load 失敗時，整個 failed batch 怎麼處理
@@ -455,8 +543,8 @@ dlq:
         key: doris-dlq-password
 
   # ── 共用 Doris error table 設定（可選）──
-  # 如果兩層都用 doris 且想寫到同一張表，可以用 shared_doris 省掉重複設定
-  # processing_error 和 sink_error 的 doris 設定會 fallback 到這裡
+  # 如果多層都用 doris 且想寫到同一張表，可以用 shared_doris 省掉重複設定
+  # 任何一層（consumer/processing/producer/sink）沒寫自己的 doris 就 fallback 到這裡
   # shared_doris:
   #   host: doris-fe
   #   http_port: 8030
@@ -1014,63 +1102,20 @@ spec:
             {{- end }}
             {{- end }}
             {{- with $.Values.dlq }}
-            {{- /* ── processing_error DLQ ── */}}
+            {{- $shared := .shared_doris }}
+            {{- /* 四層各自獨立；沒設的層不產生 env（app 端預設 crash）。
+                   每層的 env 由 quix-passthrough.dlqEnv helper 統一渲染。*/}}
+            {{- with .consumer_error }}
+            {{- include "quix-passthrough.dlqEnv" (dict "prefix" "CONSUMER" "layer" . "group" $name "shared" $shared) | nindent 12 }}
+            {{- end }}
             {{- with .processing_error }}
-            - name: DLQ_PROCESSING_MODE
-              value: {{ .mode | default "crash" | quote }}
-            {{- if eq (.mode | default "crash") "kafka" }}
-            - name: DLQ_PROCESSING_TOPIC
-              value: {{ (.kafka).topic | default (printf "dlq.processing-%s" $name) | quote }}
+            {{- include "quix-passthrough.dlqEnv" (dict "prefix" "PROCESSING" "layer" . "group" $name "shared" $shared) | nindent 12 }}
             {{- end }}
-            {{- if eq (.mode | default "crash") "doris" }}
-            {{- $d := .doris | default ($.Values.dlq).shared_doris | default dict }}
-            - name: DLQ_PROCESSING_DORIS_HOST
-              value: {{ $d.host | quote }}
-            - name: DLQ_PROCESSING_DORIS_HTTP_PORT
-              value: {{ $d.http_port | default 8030 | quote }}
-            - name: DLQ_PROCESSING_DORIS_DATABASE
-              value: {{ $d.database | default "error_log" | quote }}
-            - name: DLQ_PROCESSING_DORIS_TABLE
-              value: {{ $d.table | default "__dlq_processing" | quote }}
-            - name: DLQ_PROCESSING_DORIS_USERNAME
-              value: {{ $d.username | default "root" | quote }}
-            {{- if $d.passwordSecretRef }}
-            - name: DLQ_PROCESSING_DORIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $d.passwordSecretRef.name }}
-                  key: {{ $d.passwordSecretRef.key }}
+            {{- with .producer_error }}
+            {{- include "quix-passthrough.dlqEnv" (dict "prefix" "PRODUCER" "layer" . "group" $name "shared" $shared) | nindent 12 }}
             {{- end }}
-            {{- end }}
-            {{- end }}
-            {{- /* ── sink_error DLQ ── */}}
             {{- with .sink_error }}
-            - name: DLQ_SINK_MODE
-              value: {{ .mode | default "crash" | quote }}
-            {{- if eq (.mode | default "crash") "kafka" }}
-            - name: DLQ_SINK_TOPIC
-              value: {{ (.kafka).topic | default (printf "dlq.sink-%s" $name) | quote }}
-            {{- end }}
-            {{- if eq (.mode | default "crash") "doris" }}
-            {{- $d := .doris | default ($.Values.dlq).shared_doris | default dict }}
-            - name: DLQ_SINK_DORIS_HOST
-              value: {{ $d.host | quote }}
-            - name: DLQ_SINK_DORIS_HTTP_PORT
-              value: {{ $d.http_port | default 8030 | quote }}
-            - name: DLQ_SINK_DORIS_DATABASE
-              value: {{ $d.database | default "error_log" | quote }}
-            - name: DLQ_SINK_DORIS_TABLE
-              value: {{ $d.table | default "__dlq_sink" | quote }}
-            - name: DLQ_SINK_DORIS_USERNAME
-              value: {{ $d.username | default "root" | quote }}
-            {{- if $d.passwordSecretRef }}
-            - name: DLQ_SINK_DORIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $d.passwordSecretRef.name }}
-                  key: {{ $d.passwordSecretRef.key }}
-            {{- end }}
-            {{- end }}
+            {{- include "quix-passthrough.dlqEnv" (dict "prefix" "SINK" "layer" . "group" $name "shared" $shared) | nindent 12 }}
             {{- end }}
             {{- end }}
           volumeMounts:
@@ -1202,6 +1247,51 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/name: {{ include "quix-passthrough.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{- /*
+quix-passthrough.dlqEnv — 渲染「一層」DLQ 的 DLQ_<PREFIX>_* env vars。
+四層（CONSUMER / PROCESSING / PRODUCER / SINK）共用這個 helper，避免重複。
+呼叫方式（傳一個 dict）：
+  {{ include "quix-passthrough.dlqEnv" (dict "prefix" "CONSUMER" "layer" . "group" $name "shared" $shared) }}
+  prefix : env 前綴，如 "PROCESSING"（app 端對應 DLQ_PROCESSING_MODE 等）
+  layer  : 該層的設定（.consumer_error / .processing_error / ...）
+  group  : group name，用來組預設 topic / table 名稱
+  shared : .Values.dlq.shared_doris（doris mode 的 fallback）
+預設 topic = dlq.<prefix小寫>-<group>；預設 doris table = __dlq_<prefix小寫>。
+*/}}
+{{- define "quix-passthrough.dlqEnv" -}}
+{{- $prefix := .prefix }}
+{{- $layer := .layer }}
+{{- $group := .group }}
+{{- $lower := lower $prefix }}
+{{- $mode := $layer.mode | default "crash" }}
+- name: DLQ_{{ $prefix }}_MODE
+  value: {{ $mode | quote }}
+{{- if eq $mode "kafka" }}
+- name: DLQ_{{ $prefix }}_TOPIC
+  value: {{ ($layer.kafka).topic | default (printf "dlq.%s-%s" $lower $group) | quote }}
+{{- end }}
+{{- if eq $mode "doris" }}
+{{- $d := $layer.doris | default .shared | default dict }}
+- name: DLQ_{{ $prefix }}_DORIS_HOST
+  value: {{ $d.host | quote }}
+- name: DLQ_{{ $prefix }}_DORIS_HTTP_PORT
+  value: {{ $d.http_port | default 8030 | quote }}
+- name: DLQ_{{ $prefix }}_DORIS_DATABASE
+  value: {{ $d.database | default "error_log" | quote }}
+- name: DLQ_{{ $prefix }}_DORIS_TABLE
+  value: {{ $d.table | default (printf "__dlq_%s" $lower) | quote }}
+- name: DLQ_{{ $prefix }}_DORIS_USERNAME
+  value: {{ $d.username | default "root" | quote }}
+{{- if $d.passwordSecretRef }}
+- name: DLQ_{{ $prefix }}_DORIS_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ $d.passwordSecretRef.name }}
+      key: {{ $d.passwordSecretRef.key }}
+{{- end }}
+{{- end }}
+{{- end }}
 ```
 
 ### `templates/_validate.tpl`
@@ -1215,24 +1305,16 @@ Helm template 層的 pre-deploy 檢查。`helm install/upgrade` 時如果設定�
 {{- $validModes := list "kafka" "doris" "skip" "crash" }}
 
 {{- with .Values.dlq }}
-
-{{- /* processing_error 驗證 */}}
-{{- with .processing_error }}
+{{- $dlq := . }}
+{{- /* 四層共用同一套驗證：mode 合法 + doris mode 需要 doris/shared_doris 設定 */}}
+{{- range $layer := list "consumer_error" "processing_error" "producer_error" "sink_error" }}
+{{- with index $dlq $layer }}
 {{- if not (has .mode $validModes) }}
-{{- fail (printf "dlq.processing_error.mode must be one of %s, got '%s'" ($validModes | join ", ") .mode) }}
+{{- fail (printf "dlq.%s.mode must be one of %s, got '%s'" $layer ($validModes | join ", ") .mode) }}
 {{- end }}
-{{- if and (eq .mode "doris") (not (or .doris ($.Values.dlq).shared_doris)) }}
-{{- fail "dlq.processing_error.mode=doris requires either processing_error.doris or shared_doris config" }}
+{{- if and (eq .mode "doris") (not (or .doris $dlq.shared_doris)) }}
+{{- fail (printf "dlq.%s.mode=doris requires either %s.doris or shared_doris config" $layer $layer) }}
 {{- end }}
-{{- end }}
-
-{{- /* sink_error 驗證 */}}
-{{- with .sink_error }}
-{{- if not (has .mode $validModes) }}
-{{- fail (printf "dlq.sink_error.mode must be one of %s, got '%s'" ($validModes | join ", ") .mode) }}
-{{- end }}
-{{- if and (eq .mode "doris") (not (or .doris ($.Values.dlq).shared_doris)) }}
-{{- fail "dlq.sink_error.mode=doris requires either sink_error.doris or shared_doris config" }}
 {{- end }}
 {{- end }}
 
@@ -1362,7 +1444,15 @@ helm upgrade quix-passthrough ./chart/quix-passthrough -n quix
 ## 錯誤處理架構
 
 ```
-Kafka message 進入 Quix Streams app
+Kafka poll → 反序列化成 Row
+    │     └── 錯誤？ → on_consumer_error callback        ← 進 SDF 之前；唯一能攔反序列化的點
+    │           │       ┌──────────────────────────────────────────┐
+    │           │       │ DLQ_CONSUMER_MODE 決定去向：              │
+    │           │       │  kafka/doris/skip → 跳過該筆壞訊息，繼續  │
+    │           │       │  crash → app crash（同筆會 replay 再炸）  │
+    │           │       └──────────────────────────────────────────┘
+    ▼
+Quix Streams app
     │
     ├── SDF pipeline（apply / filter / update）
     │     └── 錯誤？ → on_processing_error callback
@@ -1372,6 +1462,13 @@ Kafka message 進入 Quix Streams app
     │           │       │  doris → Doris error table               │
     │           │       │  skip  → 跳過，不寫 DLQ                  │
     │           │       │  crash → app crash，重啟後 replay        │
+    │           │       └──────────────────────────────────────────┘
+    │
+    ├── to_topic() / changelog → produce 到 Kafka
+    │     └── 序列化 / 投遞失敗？ → on_producer_error callback
+    │           │       ┌──────────────────────────────────────────┐
+    │           │       │ DLQ_PRODUCER_MODE 決定去向：              │
+    │           │       │  kafka / doris / skip / crash            │
     │           │       └──────────────────────────────────────────┘
     │
     ├── Checkpoint commit → Sink flush
@@ -1391,14 +1488,19 @@ Kafka message 進入 Quix Streams app
           sdf.filter(is_invalid).to_topic(dlq_topic)
 ```
 
-### 兩層 DLQ 獨立設定
+### 四層 DLQ 獨立設定
 
-`processing_error` 和 `sink_error` **各自獨立選擇** DLQ 目的地，互不影響：
+四層**各自獨立選擇** DLQ 目的地，互不影響。沒設的層 = 預設 `crash`：
 
-| 層級 | 環境變數 prefix | 攔截什麼 | mode 選項 |
-|------|----------------|---------|----------|
-| **processing_error** | `DLQ_PROCESSING_*` | SDF pipeline 內 apply/filter/update 拋的異常 | kafka / doris / skip / crash |
-| **sink_error** | `DLQ_SINK_*` | DorisSink Stream Load 失敗 | kafka / doris / skip / crash |
+| 層級 | 環境變數 prefix | callback | 攔截什麼 | mode 選項 |
+|------|----------------|----------|---------|----------|
+| **consumer_error** | `DLQ_CONSUMER_*` | `on_consumer_error` | poll / 反序列化失敗（髒 JSON、schema 不符），**進 SDF 前** | kafka / doris / skip / crash |
+| **processing_error** | `DLQ_PROCESSING_*` | `on_processing_error` | SDF pipeline 內 apply/filter/update 拋的異常 | kafka / doris / skip / crash |
+| **producer_error** | `DLQ_PRODUCER_*` | `on_producer_error` | to_topic / changelog 序列化 / produce 到 Kafka 失敗 | kafka / doris / skip / crash |
+| **sink_error** | `DLQ_SINK_*` | `on_stream_load_error` | DorisSink Stream Load 失敗 | kafka / doris / skip / crash |
+
+> `consumer_error` / `processing_error` / `producer_error` 是 Quix Streams 框架層級 callback，跟 sink 類型無關；
+> `sink_error` 則只對有實作 error callback 的 sink 有效（見下方「Sink DLQ 支援範圍」）。
 
 每層的 mode：
 
@@ -1427,9 +1529,27 @@ Kafka message 進入 Quix Streams app
 如果你的 group 同時使用 DorisSink + KafkaSink（fan-out），DorisSink 失敗時走 DLQ 繼續，
 但 KafkaSink 失敗時仍然會 crash。兩者是獨立的 sink instance，互不影響。
 
-`processing_error` 是 Quix Streams 框架層級的 callback（`on_processing_error`），
-跟 sink 類型無關，對所有 sink 都有效 — 因為它攔截的是 SDF pipeline 內的錯誤，
-發生在資料到達 sink 之前。
+`consumer_error` / `processing_error` / `producer_error` 都是 Quix Streams 框架層級的 callback，
+跟 sink 類型無關，對所有 sink 都有效 — 因為它們攔截的是 sink 之前各階段的錯誤。
+
+### 四個 Application callback 一覽
+
+`Application` 接受**四個** callback,對應 pipeline 不同階段。本 chart 已把其中三個 error callback
+接進可設定 DLQ(第四個 `on_message_processed` 是觀測用,不是錯誤處理):
+
+| callback | 觸發階段 | 攔截什麼 | 預設行為 | 本 chart |
+|----------|---------|---------|---------|:--------:|
+| `on_consumer_error` | poll Kafka / **反序列化** | value/key 反序列化失敗(壞 JSON、schema 不符) | `return False` → **crash** | ✓ DLQ_CONSUMER |
+| `on_processing_error` | SDF `.process()` | apply / filter / update 內拋的異常 | `return False` → crash | ✓ DLQ_PROCESSING |
+| `on_producer_error` | 序列化 / produce 到 Kafka | `to_topic()` / changelog 寫 Kafka 時序列化/送出失敗 | `return False` → crash | ✓ DLQ_PRODUCER |
+| `on_message_processed` | 每筆成功處理**之後** | 不是錯誤 — 觀測 hook(topic, partition, offset) | `None`(不做事) | — |
+
+關鍵點：
+
+- **三個 error callback 的約定一致**:callback 回 `True` → 忽略該例外、繼續;回 `False`(或用預設)→ 例外往上拋,app 最終停掉(K8s 重啟 → 從 last committed offset replay)。定義在 `quixstreams/error_callbacks.py`,三個預設(`default_on_consumer_error` / `default_on_processing_error` / `default_on_producer_error`)**都 `return False`**。本 chart 的 `make_*_error_handler` 會在有設定 DLQ 時改成「寫 DLQ + 回 True 跳過」。
+- **`on_consumer_error` 是反序列化錯誤的唯一攔截點**:一筆壞掉的訊息會在**進 SDF 之前**就炸,`processing_error` 的 DLQ 攔不到。所以 `consumer_error` 建議設 `skip` 或 `kafka`,否則一筆髒資料會 crash-loop(預設 `crash`)。
+- **`on_consumer_error` / `on_producer_error` 必須在建構 `Application` 時傳入**(綁進 internal consumer/producer),不能像 `on_processing_error` 那樣事後設屬性。`main()` 用 late-bound lambda 解掉「callback 需要在建構時給、但 DLQ handler 需要 app」的雞生蛋(見 App 程式碼)。
+- **`on_message_processed` 是觀測用**,不是錯誤處理。每筆成功處理後被呼叫,常用來做吞吐統計 — `dashboard/collector`(quix-metrics)的 `MetricsAgent` 就是 monkey-patch 這個 hook 來數每 partition 的訊息量。預設 `None`(零成本),有掛才有事做。本 chart 沒接它(交給獨立的 metrics agent)。
 
 ### `values.yaml` 組合範例
 
@@ -1462,7 +1582,7 @@ dlq:
     mode: doris
   sink_error:
     mode: doris
-  shared_doris:                    # 兩層共用同一份 Doris 設定
+  shared_doris:                    # 多層共用同一份 Doris 設定
     host: doris-fe
     database: error_log
     table: __dlq                   # 同一張表，用 source 欄位區分
