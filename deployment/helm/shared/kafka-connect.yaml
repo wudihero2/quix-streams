@@ -1,0 +1,47 @@
+name: kafka-connect
+
+service:
+  labels:
+    app: kafka-connect
+  ports:
+    - name: kafka-connect
+      port: 8083
+    - name: metrics
+      port: 8080
+  type: ClusterIP
+  selector:
+    app: kafka-connect
+
+replicaCount: 2
+
+deployment:
+  volumes:
+
+  containers:
+    kafka-connect:
+      name: kafka-connect
+      image:
+        repository: quay.io/debezium/connect
+        tag: "2.3"
+      ports:
+        - name: kafka-connect
+          port: 8083
+        - name: metrics
+          port: 8080
+      envFromConfigmap:
+        - name: kafka-connect-env
+      envFromSecret:
+        - name: eso-kafka-connect-env
+      volumes:
+        - name: kafka-connect-secrets
+          path: /secrets
+          readOnly: true
+        - name: kafka-connect-credentials
+          path: /secrets/.credentials
+          readOnly: true
+      resources:
+        limits:
+          memory: "1Gi"
+        requests:
+          cpu: "300m"
+          memory: "1Gi"

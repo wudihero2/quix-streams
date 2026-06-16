@@ -1,0 +1,1 @@
+https://docs.redhat.com/en/documentation/red_hat_streams_for_apache_kafka/3.0/html/using_streams_for_apache_kafka_on_rhel/assembly-mirrormaker-str

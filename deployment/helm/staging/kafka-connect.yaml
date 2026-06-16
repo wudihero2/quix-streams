@@ -1,0 +1,11 @@
+replicaCount: 3
+
+deployment:
+  containers:
+    kafka-connect:
+      resources:
+        limits:
+          memory: "6Gi"
+        requests:
+          cpu: "300m"
+          memory: "2Gi"

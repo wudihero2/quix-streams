@@ -1,0 +1,122 @@
+plugins {
+    id "java"
+    // https://github.com/michel-kraemer/gradle-download-task
+    id "de.undercouch.download" version "5.4.0"
+}
+
+configurations {
+    sharedLibraries
+
+    pluginLibraries
+    pluginMongodbKafkaConnect {
+        extendsFrom pluginLibraries
+    }
+    pluginAivenKafkaConnectGcs {
+        extendsFrom pluginLibraries
+    }
+    pluginDebeziumConnectorMysql {
+        extendsFrom pluginLibraries
+    }
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        url "https://packages.confluent.io/maven/"
+    }
+}
+
+ext {
+    aivenConnectCommonsVersion = "[0.9,0.99)"
+    apacheKafkaConnectAPI = "[3.4,3.5)"
+    confluentKafkaConnect = "[7.3,7.4)"
+    mongodbKafkaConnect = "[1.9,1.10)"
+    mongodbDriver = "[4.9,4.10)"
+    strimziProviderVersion = "[1.1,1.2)"
+}
+
+dependencies {
+    // Confluent
+    // Avro
+    sharedLibraries "io.confluent:kafka-connect-avro-converter:${confluentKafkaConnect}"
+    sharedLibraries "io.confluent:kafka-connect-avro-data:${confluentKafkaConnect}"
+    sharedLibraries "io.confluent:kafka-avro-serializer:${confluentKafkaConnect}"
+    sharedLibraries "io.confluent:kafka-schema-serializer:${confluentKafkaConnect}"
+    sharedLibraries "io.confluent:kafka-schema-registry-client:${confluentKafkaConnect}"
+    sharedLibraries "io.confluent:common-config:${confluentKafkaConnect}"
+    sharedLibraries "io.confluent:common-utils:${confluentKafkaConnect}"
+
+    // Transform filter
+    sharedLibraries 'io.debezium:debezium-scripting:2.3.6.Final'
+    pluginDebeziumConnectorMysql 'org.codehaus.groovy:groovy-jsr223:3.0.20'
+
+    // Strimzi
+    // https://github.com/strimzi/kafka-env-var-config-provider
+    sharedLibraries "io.strimzi:kafka-env-var-config-provider:${strimziProviderVersion}"
+    // https://github.com/strimzi/kafka-kubernetes-config-provider
+    sharedLibraries "io.strimzi:kafka-kubernetes-config-provider:${strimziProviderVersion}"
+
+    // MongoDB
+    // https://github.com/mongodb/mongo-kafka
+    pluginMongodbKafkaConnect "org.mongodb.kafka:mongo-kafka-connect:${mongodbKafkaConnect}"
+    pluginMongodbKafkaConnect "org.mongodb:mongodb-driver-sync:${mongodbDriver}"
+    pluginMongodbKafkaConnect "org.apache.kafka:connect-api:${apacheKafkaConnectAPI}"
+
+    // Aiven
+    // https://github.com/aiven/gcs-connector-for-apache-kafka
+    pluginAivenKafkaConnectGcs "io.aiven:aiven-kafka-connect-commons:0.7.0"
+    pluginAivenKafkaConnectGcs "io.aiven:aiven-kafka-connect-gcs:${aivenConnectCommonsVersion}"
+}
+
+def copyPluginLibraries = []
+configurations.each { conf ->
+    if (configurations.pluginLibraries.name in conf.extendsFrom.name) {
+        def taskName = "copyPluginLibraries-${conf.name}"
+        def dirName = conf.name.replaceAll(/\B[A-Z]/) { '-' + it }.toLowerCase() - 'plugin-'
+        tasks.register(taskName, Copy) {
+            from conf
+            into layout.buildDirectory.dir("plugins/${dirName}")
+        }
+        copyPluginLibraries.add(taskName)
+    }
+}
+
+tasks.register('downloadZipFiles', Download) {
+    def ccloudUrl = "https://d2p6pa21dvn84.cloudfront.net/api/plugins"
+    src([
+        "${ccloudUrl}/confluentinc/kafka-connect-datagen/versions/0.6.1/confluentinc-kafka-connect-datagen-0.6.1.zip",
+        "${ccloudUrl}/confluentinc/kafka-connect-gcs/versions/10.1.6/confluentinc-kafka-connect-gcs-10.1.6.zip",
+        "${ccloudUrl}/wepay/kafka-connect-bigquery/versions/2.5.2/wepay-kafka-connect-bigquery-2.5.2.zip",
+    ])
+    dest layout.buildDirectory.dir("zip")
+    onlyIfModified true
+}
+
+tasks.register('downloadAndUnzipFiles') {
+    dependsOn 'downloadZipFiles'
+    doLast {
+        fileTree(downloadZipFiles.dest).matching {
+            include "*.zip"
+        }.each { File file ->
+            def dir = file.name.take(file.name.lastIndexOf('-'))
+            copy {
+                from(zipTree(file)) {
+                    include "*/lib/**"
+                }
+                into layout.buildDirectory.dir("plugins")
+            }
+        }
+    }
+}
+
+tasks.register('copySharedLibraries', Copy) {
+    description 'Copy shared libraries to the target directory.'
+    from configurations.sharedLibraries
+    into layout.buildDirectory.dir("plugins/shared")
+}
+
+defaultTasks(
+    'copySharedLibraries',
+    'downloadAndUnzipFiles',
+    *copyPluginLibraries,
+)

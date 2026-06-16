@@ -1,0 +1,7 @@
+__pycache__
+plugins/
+build/
+deploy/
+temp/
+.gradle
+bash_history
