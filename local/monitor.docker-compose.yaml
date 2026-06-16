@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  prometheus:
+    profiles: ["monitor"]
+    image: prom/prometheus:${PROMETHEUS_VERSION:-v2.43.0}
+    ports:
+      - 9090:9090
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      # hot reload (curl -X POST 127.0.0.1:9090/-/reload)
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+      - '--storage.tsdb.path=/prometheus'
+    volumes:
+      - ./init/prometheus:/etc/prometheus
+    networks:
+      - infra-internal
+
+  grafana:
+    profiles: ["monitor"]
+    image: grafana/grafana:${GRAFANA_VERSION:-9.4.7}
+    ports:
+      - 3000:3000
+    volumes:
+      - ./init/grafana/provisioning:/etc/grafana/provisioning
+      - ./init/grafana/dashboards:/var/lib/grafana/dashboards
+    environment:
+      - DS_PROMETHEUS=prometheus
+    networks:
+      - infra-internal
+
+networks:
+  infra-internal:
+    name: dev-infra-internal
+    external: true

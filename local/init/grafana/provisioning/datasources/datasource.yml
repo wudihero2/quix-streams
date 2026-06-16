@@ -1,0 +1,10 @@
+apiVersion: 1
+
+# Reload datasources
+# curl -X POST http://admin:admin@127.0.0.1:3000/api/admin/provisioning/datasources/reload
+datasources:
+- name: Prometheus
+  type: prometheus
+  url: http://prometheus:9090
+  access: proxy
+  version: 1

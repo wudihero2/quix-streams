@@ -1,0 +1,179 @@
+version: "3.9"
+
+x-services:
+  kafka-service: &kafka-service
+    profiles: ["kafka"]
+    image: quay.io/debezium/kafka:${DEBEZIUM_VERSION}
+    environment: &kafka-environment
+      ADVERTISED_HOST_NAME: host.docker.internal
+      ZOOKEEPER_CONNECT: kafka-zookeeper:2181
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      VAR__BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+    restart: on-failure
+    depends_on:
+      - kafka-zookeeper
+    networks:
+      - infra-internal
+
+services:
+  kafka-zookeeper:
+    profiles: ["kafka"]
+    image: quay.io/debezium/zookeeper:${DEBEZIUM_VERSION}
+    container_name: kafka-zookeeper
+    ports:
+      - 2181:2181
+      - 2888:2888
+      - 3888:3888
+    volumes:
+      - kafka-zookeeper_data:/zookeeper/data
+      - kafka-zookeeper_txns:/zookeeper/txns
+      - kafka-zookeeper_cfg:/zookeeper/conf
+    networks:
+      - infra-internal
+
+  kafka-1:
+    <<: *kafka-service
+    container_name: kafka-1
+    ports:
+      - "19092:9092"
+    volumes:
+      - kafka-1_data:/kafka/data
+      - kafka-1_cfg:/kafka/config
+    environment:
+      <<: *kafka-environment
+      BROKER_ID: 1
+      KAFKA_ADVERTISED_PORT: 19092
+
+  kafka-2:
+    <<: *kafka-service
+    container_name: kafka-2
+    ports:
+      - "29092:9092"
+    volumes:
+      - kafka-2_data:/kafka/data
+      - kafka-2_cfg:/kafka/config
+    environment:
+      <<: *kafka-environment
+      BROKER_ID: 2
+      KAFKA_ADVERTISED_PORT: 29092
+
+  kafka-3:
+    <<: *kafka-service
+    container_name: kafka-3
+    ports:
+      - "39092:9092"
+    volumes:
+      - kafka-3_data:/kafka/data
+      - kafka-3_cfg:/kafka/config
+    environment:
+      <<: *kafka-environment
+      BROKER_ID: 3
+      KAFKA_ADVERTISED_PORT: 39092
+
+  # https://docs.confluent.io/platform/current/connect/references/restapi.html
+  kafka-connect:
+    profiles: ["kafka"]
+    image: sldatacenter/debezium:dev
+    container_name: kafka-connect
+    ports:
+      - 8083:8083
+      - 8084:8080
+    volumes:
+      - kafka-connect_cfg:/kafka/config
+      - ../sl-debezium/configs/local/secrets:/secrets
+      - ../sl-debezium/docker/config.yml:/kafka/etc/config.yml
+      - ../.credentials:/secrets/.credentials
+    environment:
+      BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      GROUP_ID: dbz.connect_1
+      CONFIG_STORAGE_TOPIC: dbz.connect_configs
+      OFFSET_STORAGE_TOPIC: dbz.connect_offsets
+      STATUS_STORAGE_TOPIC: dbz.connect_statuses
+      CONNECT_CONFIG_PROVIDERS: file,env
+      CONNECT_CONFIG_PROVIDERS_FILE_CLASS: org.apache.kafka.common.config.provider.FileConfigProvider
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: io.strimzi.kafka.EnvVarConfigProvider
+      SCHEMA_REGISTRY_URL: http://kafka-schemaregistry:8081
+      KAFKA_OPTS: -javaagent:/kafka/etc/jmx_prometheus_javaagent.jar=8080:/kafka/etc/config.yml
+      JMXHOST: localhost
+      JMXPORT: 1976
+    networks:
+      - infra-internal
+
+  kafka-connect-helper:
+    profiles: ["kafka"]
+    image: sldatacenter/debezium-helper:dev
+    container_name: kafka-connect-helper
+    volumes:
+      - ../sl-debezium:/root
+    working_dir: /root
+    tty: true
+    depends_on:
+      - kafka-connect
+    networks:
+      - infra-internal
+
+  # https://docs.confluent.io/platform/current/schema-registry/avro.html
+  kafka-schemaregistry:
+    profiles: ["kafka"]
+    image: confluentinc/cp-schema-registry:${CONFLUENT_VERSION}
+    container_name: kafka-schemaregistry
+    ports:
+      - 8181:8181
+      - 8082:8081
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL: PLAINTEXT
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_HOST_NAME: kafka-schemaregistry
+      SCHEMA_REGISTRY_LISTENERS: http://kafka-schemaregistry:8081
+    restart: on-failure
+    depends_on:
+      - kafka-1
+      - kafka-2
+      - kafka-3
+    networks:
+      - infra-internal
+
+  kafka-ui:
+    profiles: ["kafka"]
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - 8080:8080
+    depends_on:
+      - kafka-zookeeper
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-docker
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://kafka-schemaregistry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: local-docker
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+    networks:
+      - infra-internal
+
+volumes:
+  kafka-zookeeper_data:
+    name: dev-kafka-zookeeper_data
+  kafka-zookeeper_txns:
+    name: dev-kafka-zookeeper_txns
+  kafka-zookeeper_cfg:
+    name: dev-kafka-zookeeper_cfg
+  kafka-1_data:
+    name: dev-kafka-1_data
+  kafka-1_cfg:
+    name: dev-kafka-1_cfg
+  kafka-2_data:
+    name: dev-kafka-2_data
+  kafka-2_cfg:
+    name: dev-kafka-2_cfg
+  kafka-3_data:
+    name: dev-kafka-3_data
+  kafka-3_cfg:
+    name: dev-kafka-3_cfg
+  kafka-connect_cfg:
+    name: dev-kafka-connect_cfg
+
+networks:
+  infra-internal:
+    name: dev-infra-internal
+    external: true

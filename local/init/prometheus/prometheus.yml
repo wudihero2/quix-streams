@@ -1,0 +1,69 @@
+global:
+  scrape_interval: 15s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
+  evaluation_interval: 15s # Evaluate rules every 15 seconds. The default is every 1 minute.
+  # scrape_timeout is set to the global default (10s).
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# A scrape configuration containing exactly one endpoint to scrape:
+# Here it's Prometheus itself.
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  - job_name: "prometheus"
+
+    # metrics_path defaults to '/metrics'
+    # scheme defaults to 'http'.
+
+    static_configs:
+      - targets:
+          - "localhost:9090"
+          - "kafka-connect:8080"
+        labels:
+          namespace: "sl-data-center"
+
+  - job_name: "tidb"
+    honor_labels: true
+    static_configs:
+      - targets:
+          - "tidb:10080"
+  - job_name: "ticdc"
+    honor_labels: true
+    static_configs:
+      - targets:
+          - "tidb:8300"
+  - job_name: "pd"
+    honor_labels: true
+    static_configs:
+      - targets:
+          - "tidb:2379"
+  - job_name: "tikv"
+    honor_labels: true
+    static_configs:
+      - targets:
+          - "tidb:20180"
+
+  - job_name: "jobmanager"
+    static_configs:
+      - targets:
+          - "flink-jobmanager:9249"
+  - job_name: 'taskmanager-1'
+    static_configs:
+    - targets: ['sldatacenter-flink-taskmanager-1:9249']
+  - job_name: 'taskmanager-2'
+    static_configs:
+    - targets: ['sldatacenter-flink-taskmanager-2:9249']
+
+  - job_name: "trino"
+    static_configs:
+      - targets:
+          - "trino-coordinator:12345"
